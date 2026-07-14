@@ -4,9 +4,10 @@ using System.Text;
 using System.Text.Json;
 
 const string Usage = """
-Assistant <repository-url> [target-directory]
+Assistant <repository-url> [target-directory] [--chat]
 
 Clones a Git repository at startup, then indexes the cloned content.
+With --chat flag: starts interactive RAG chat with a local LLM after indexing.
 
 Arguments:
   repository-url    URL of the Git repository (required)
@@ -17,11 +18,15 @@ Environment variables:
   EMBEDDING_API_URL            Embedding API URL (default: http://localhost:1234)
   EMBEDDING_API_KEY            Embedding API key (optional)
   EMBEDDING_MODEL              Embedding model name (default: nomic-embed-text)
+  LLM_API_URL                  LLM API URL (default: http://localhost:1234)
+  LLM_API_KEY                  LLM API key (optional)
+  LLM_MODEL                    LLM model name (default: qwen/qwen3.6-35b-a3b)
 
 Examples:
   dotnet run -- git@gitserver.local.yurion.ru:andreyk/rust-design-patterns.git
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir
-  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --env EMBEDDING_API_URL=http://localhost:11434
+  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat
+  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat LLM_API_URL=http://localhost:11434
 """;
 
 if (args.Length == 0)
@@ -32,7 +37,23 @@ if (args.Length == 0)
 }
 
 var repoUrl = args[0];
-string targetDir = args.Length > 1 ? args[1] : "./cloned-repo";
+string targetDir = "./cloned-repo";
+bool runChat = false;
+
+for (int i = 1; i < args.Length; i++)
+{
+    var arg = args[i];
+    if (arg.Equals("--chat", StringComparison.OrdinalIgnoreCase))
+    {
+        runChat = true;
+    }
+    else if (!targetDir.Equals("./cloned-repo", StringComparison.Ordinal) || i > 1)
+    {
+        // First non-flag arg is target directory
+        if (targetDir.Equals("./cloned-repo", StringComparison.Ordinal))
+            targetDir = arg;
+    }
+}
 
 var isHttps = repoUrl.StartsWith("https://", StringComparison.Ordinal);
 string? token = null;
@@ -104,7 +125,7 @@ if (process.ExitCode == 0)
         Console.WriteLine(output);
 
     // === ИНДЕКСАЦИЯ (после успешного git clone) ===
-    await RunIndexingAsync(targetDir);
+    await RunIndexingAsync(targetDir, runChat);
 }
 else
 {
@@ -116,7 +137,7 @@ else
     Environment.ExitCode = 1;
 }
 
-static async Task RunIndexingAsync(string targetDir)
+static async Task RunIndexingAsync(string targetDir, bool runChat)
 {
     Console.WriteLine("\n=== Запуск индексации ===");
 
@@ -170,6 +191,58 @@ static async Task RunIndexingAsync(string targetDir)
     Console.WriteLine($"  Structural чанков: {result2.ChunksCreated}");
 
     embeddingService.Dispose();
+
+    if (runChat)
+    {
+        Console.WriteLine("\n=== Запуск интерактивного чата ===");
+        await RunChatAsync(targetDir, dbPath);
+    }
+}
+
+static async Task RunChatAsync(string targetDir, string dbPath)
+{
+    var store = new SqliteVectorStore(dbPath);
+    await store.InitializeAsync();
+
+    var embeddingApiUrl = Environment.GetEnvironmentVariable("EMBEDDING_API_URL") ?? "http://192.168.1.15:1234";
+    var embeddingModel = Environment.GetEnvironmentVariable("EMBEDDING_MODEL") ?? "text-embedding-nomic-embed-text-v1.5";
+    var embeddingService = new OpenAiCompatibleEmbeddingService(embeddingApiUrl, embeddingModel);
+
+    var llmApiUrl = Environment.GetEnvironmentVariable("LLM_API_URL") ?? "http://192.168.1.15:1234";
+    var llmModel = Environment.GetEnvironmentVariable("LLM_MODEL") ?? "qwen/qwen3.6-35b-a3b";
+    var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
+
+    Console.WriteLine($"Проверка LLM API ({llmApiUrl})...");
+    ILlmService llm;
+    try 
+    {
+        llm = new OpenAiCompatibleLlmService(llmApiUrl, llmModel, llmApiKey, 4096);
+        // Quick connectivity check by making a minimal request
+        var testPrompt = "Respond with exactly: OK";
+        await llm.AskAsync(testPrompt, "You are a test assistant. Respond with exactly 'OK' and nothing else.", 10);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("✅ LLM API доступен\n");
+        Console.ResetColor();
+    }
+    catch (Exception ex) 
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"❌ LLM API недоступен: {ex.Message}");
+        Console.ResetColor();
+        Console.WriteLine("Убедитесь, что LLM API запущен на {0}", llmApiUrl);
+        Console.WriteLine("Запустите без --chat для работы только с индексацией.");
+        return;
+    }
+
+    var extensions = new[] { ".txt", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
+
+    var rewrite = new HeuristicQueryRewriteService();
+    var rag = new EnhancedRagPipeline(embeddingService, store, rewrite);
+    var validator = new CitationValidator();
+    var chat = new ChatService(llm, rag, validator);
+
+    try { await chat.RunInteractiveAsync(); }
+    finally { llm.Dispose(); embeddingService.Dispose(); }
 }
 
 static string NormalizeGitUrl(string url, string? token)
