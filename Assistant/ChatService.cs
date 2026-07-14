@@ -1,4 +1,6 @@
+using System.Net.Http.Json;
 using System.Text.Json;
+using OpenAI.Chat;
 
 public class ChatService
 {
@@ -6,6 +8,11 @@ public class ChatService
     private readonly EnhancedRagPipeline _rag;
     private readonly CitationValidator _validator;
     private const int MaxTokens = 4096;
+
+    // MCP integration (optional)
+    private readonly McpServerManager? _mcpManager;
+    private readonly ToolExecutor? _toolExecutor;
+    private readonly List<ChatTool>? _openAiTools;
 
     public ChatService(
         ILlmService llm,
@@ -15,6 +22,23 @@ public class ChatService
         _llm = llm;
         _rag = rag;
         _validator = validator;
+    }
+
+    public ChatService(
+        ILlmService llm,
+        EnhancedRagPipeline rag,
+        CitationValidator validator,
+        McpServerManager mcpManager) : this(llm, rag, validator)
+    {
+        _mcpManager = mcpManager;
+
+        if (mcpManager.IsConnected && mcpManager.Tools != null)
+        {
+            _openAiTools = McpToolMapper.ToOpenAITools(mcpManager.Tools);
+            _toolExecutor = new ToolExecutor(mcpManager);
+
+            Console.WriteLine($"\nИнструменты MCP доступны: {_openAiTools.Count}");
+        }
     }
 
     public async Task<CitationAnswer> ProcessMessageAsync(string userMessage, ChatSession session, CancellationToken ct = default)
@@ -42,6 +66,148 @@ public class ChatService
 
         CitationAnswer? parsedAnswer = null;
         var maxRetries = GetEnvInt("RAG_MAX_RETRIES", 3);
+
+        if (_openAiTools != null && _toolExecutor != null)
+        {
+            parsedAnswer = await ProcessWithToolCallingAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
+        }
+        else
+        {
+            parsedAnswer = await ProcessWithoutToolsAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
+        }
+
+        return parsedAnswer;
+    }
+
+    private async Task<CitationAnswer> ProcessWithToolCallingAsync(
+        string userPrompt, string systemPrompt, RagResult ragResult, int maxRetries, CancellationToken ct)
+    {
+        var llmApiUrl = Environment.GetEnvironmentVariable("LLM_API_URL") ?? "http://192.168.1.15:1234";
+        var llmModel = Environment.GetEnvironmentVariable("LLM_MODEL") ?? "qwen/qwen3.6-35b-a3b";
+        var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
+
+        using var httpClient = new HttpClient
+        {
+            BaseAddress = new Uri(llmApiUrl),
+            Timeout = TimeSpan.FromSeconds(120)
+        };
+
+        if (!string.IsNullOrEmpty(llmApiKey))
+            httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", llmApiKey);
+
+        var messages = new List<Dictionary<string, string>>();
+        if (!string.IsNullOrEmpty(systemPrompt))
+            messages.Add(new Dictionary<string, string> { ["role"] = "system", ["content"] = systemPrompt });
+
+        var currentRagResult = ragResult;
+        CitationAnswer? lastParsedAnswer = null;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            var request = new Dictionary<string, object>
+            {
+                ["model"] = llmModel,
+                ["messages"] = messages,
+                ["max_tokens"] = MaxTokens,
+                ["stream"] = false,
+                ["temperature"] = 0.2,
+                ["top_p"] = 0.9,
+            };
+
+            if (_openAiTools != null)
+                request["tools"] = _openAiTools.Select(t => SerializeChatToolToJson(t)).ToList();
+
+            request["tool_choice"] = "auto";
+
+            var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request, ct);
+            response.EnsureSuccessStatusCode();
+
+            var result = await response.Content.ReadFromJsonAsync<ToolChatResponse>(ct);
+            var choice = result?.Choices?.FirstOrDefault();
+
+            if (choice == null) continue;
+
+            var toolCalls = choice.ToolCalls ?? [];
+            string? content = choice.Message?.Content;
+
+            if (!string.IsNullOrEmpty(content) && toolCalls.Count == 0)
+            {
+                var rawResponse = content;
+                lastParsedAnswer = CitationAnswerParser.Parse(rawResponse, currentRagResult!.Chunks);
+
+                if (lastParsedAnswer.Confidence == ConfidenceLevel.Unknown && !currentRagResult.IsUnknown)
+                {
+                    if (attempt < maxRetries)
+                    {
+                        userPrompt += "\n\n[SYSTEM: The context IS sufficient. Do NOT output confidence='unknown'. Provide a concrete answer with citations.]";
+                        continue;
+                    }
+                }
+
+                if (!GetEnvBool("RAG_ENABLE_VALIDATION", true))
+                    break;
+
+                var validation = _validator.Validate(lastParsedAnswer, currentRagResult.Chunks);
+                if (validation.IsValid)
+                    break;
+
+                if (attempt < maxRetries)
+                {
+                    userPrompt += $"\n\n[SYSTEM FEEDBACK: Previous response had validation errors: {string.Join("; ", validation.Errors)}. " +
+                        $"Please fix and respond with valid JSON only.]";
+                }
+                else
+                {
+                    lastParsedAnswer = CreateFallbackAnswer(currentRagResult);
+                }
+
+                currentRagResult = null;
+            }
+
+            if (toolCalls.Count > 0)
+            {
+                Console.WriteLine($"\nLLM запросил(а) {toolCalls.Count} инструмент(ов)...");
+
+                foreach (var toolCall in toolCalls)
+                {
+                    var arguments = McpToolMapper.ParseToolArguments(BinaryData.FromString(toolCall.FunctionArgs?.ToString() ?? "{}"));
+
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"\n[Инструмент: {toolCall.Function?.Name}]");
+                    if (arguments.Count > 0)
+                        Console.WriteLine($"Аргументы: {JsonSerializer.Serialize(arguments)}");
+                    Console.ResetColor();
+
+                    var callResult = await _mcpManager!.CallToolAsync(toolCall.Function?.Name ?? "", arguments);
+
+                    var formattedResult = McpToolMapper.FormatToolResult(callResult);
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    var preview = formattedResult.Length > 200 ? formattedResult[..200] + "..." : formattedResult;
+                    Console.WriteLine($"Результат: {preview}");
+                    Console.ResetColor();
+
+                    messages.Add(new Dictionary<string, string>
+                    {
+                        ["role"] = "tool",
+                        ["content"] = formattedResult,
+                        ["tool_call_id"] = toolCall.Id ?? $"tool_{Guid.NewGuid().ToString("N")[..8]}"
+                    });
+
+                }
+
+            }
+
+            currentRagResult = null;
+        }
+
+        lastParsedAnswer ??= CreateFallbackAnswer(ragResult, "All retries failed.");
+        return lastParsedAnswer;
+    }
+
+    private async Task<CitationAnswer> ProcessWithoutToolsAsync(
+        string userPrompt, string systemPrompt, RagResult ragResult, int maxRetries, CancellationToken ct)
+    {
+        CitationAnswer? parsedAnswer = null;
         var lastException = "";
 
         for (int attempt = 1; attempt <= maxRetries; attempt++)
@@ -164,7 +330,6 @@ public class ChatService
                 Console.WriteLine("\n[Querying indexed project...]");
                 Console.ResetColor();
 
-                // Add context prefix for /query to emphasize it's about the indexed project
                 question = "[This is a query about the indexed project. Base your answer on the retrieved context chunks from the indexed documentation.] " + question;
             }
 
@@ -261,4 +426,59 @@ public class ChatService
 
     private static bool GetEnvBool(string name, bool defaultValue) =>
         bool.TryParse(Environment.GetEnvironmentVariable(name), out var v) ? v : defaultValue;
+
+    private static string SerializeChatToolToJson(ChatTool tool)
+    {
+        try
+        {
+            var data = ((System.ClientModel.Primitives.IPersistableModel<ChatTool>)tool).Write(null);
+            return data.ToString();
+        }
+        catch { /* fallback below */ }
+
+        var rawData = ((System.ClientModel.Primitives.IPersistableModel<ChatTool>)tool).Write(null);
+        return rawData.ToString();
+    }
+
+    private class ToolChatResponse
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("choices")]
+        public List<ToolChoice>? Choices { get; set; }
+    }
+
+    private class ToolChoice
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("message")]
+        public ToolMessage? Message { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("tool_calls")]
+        public List<ToolCall>? ToolCalls { get; set; }
+    }
+
+    private class ToolMessage
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("content")]
+        public string? Content { get; set; }
+    }
+
+    private class ToolCall
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("id")]
+        public string? Id { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("function")]
+        public ToolFunction? Function { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("function_args")]
+        public string? FunctionArgs { get; set; }
+    }
+
+    private class ToolFunction
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("arguments")]
+        public string? Arguments { get; set; }
+    }
 }

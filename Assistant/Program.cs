@@ -239,10 +239,29 @@ static async Task RunChatAsync(string targetDir, string dbPath)
     var rewrite = new HeuristicQueryRewriteService();
     var rag = new EnhancedRagPipeline(embeddingService, store, rewrite);
     var validator = new CitationValidator();
-    var chat = new ChatService(llm, rag, validator);
+
+    McpServerManager? mcpManager = null;
+    try
+    {
+        var mcpCommand = "uvx";
+        var mcpArgs = new[] { "mcp-server-git" };
+
+        mcpManager = new McpServerManager(mcpCommand, mcpArgs);
+        await mcpManager.ConnectAsync();
+    }
+    catch { /* MCP connection is optional, continue without it */ }
+
+    var chat = mcpManager != null && mcpManager.IsConnected
+        ? new ChatService(llm, rag, validator, mcpManager)
+        : new ChatService(llm, rag, validator);
 
     try { await chat.RunInteractiveAsync(); }
-    finally { llm.Dispose(); embeddingService.Dispose(); }
+    finally
+    {
+        mcpManager?.Dispose();
+        llm.Dispose();
+        embeddingService.Dispose();
+    }
 }
 
 static string NormalizeGitUrl(string url, string? token)

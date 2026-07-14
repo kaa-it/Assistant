@@ -11,4 +11,9 @@
     <ProjectReference Include="..\Libraries\DocIndexer.Core\DocIndexer.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="MCPSharp" Version="1.0.11" />
+    <PackageReference Include="OpenAI" Version="2.12.0" />
+  </ItemGroup>
+
 </Project>
