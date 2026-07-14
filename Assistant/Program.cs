@@ -1,10 +1,12 @@
 ﻿using System.Diagnostics;
+using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 
 const string Usage = """
 Assistant <repository-url> [target-directory]
 
-Clones a Git repository at startup.
+Clones a Git repository at startup, then indexes the cloned content.
 
 Arguments:
   repository-url    URL of the Git repository (required)
@@ -12,10 +14,14 @@ Arguments:
 
 Environment variables:
   GIT_PERSONAL_ACCESS_TOKEN    Personal Access Token for HTTPS URLs (optional, required when using https://)
+  EMBEDDING_API_URL            Embedding API URL (default: http://localhost:1234)
+  EMBEDDING_API_KEY            Embedding API key (optional)
+  EMBEDDING_MODEL              Embedding model name (default: nomic-embed-text)
 
 Examples:
   dotnet run -- git@gitserver.local.yurion.ru:andreyk/rust-design-patterns.git
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir
+  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --env EMBEDDING_API_URL=http://localhost:11434
 """;
 
 if (args.Length == 0)
@@ -96,6 +102,9 @@ if (process.ExitCode == 0)
 
     if (!string.IsNullOrWhiteSpace(output))
         Console.WriteLine(output);
+
+    // === ИНДЕКСАЦИЯ (после успешного git clone) ===
+    await RunIndexingAsync(targetDir);
 }
 else
 {
@@ -105,6 +114,62 @@ else
         Console.Error.WriteLine(error);
 
     Environment.ExitCode = 1;
+}
+
+static async Task RunIndexingAsync(string targetDir)
+{
+    Console.WriteLine("\n=== Запуск индексации ===");
+
+    var dbPath = Path.Combine(Path.GetFullPath(targetDir), "document_index.db");
+    var store = new SqliteVectorStore(dbPath);
+    await store.InitializeAsync();
+
+    // OpenAI-совместимый embedding service (работает с Ollama, vLLM, LM Studio и др.)
+    var embeddingApiUrl = Environment.GetEnvironmentVariable("EMBEDDING_API_URL") ?? "http://192.168.1.15:1234";
+    var embeddingModel = Environment.GetEnvironmentVariable("EMBEDDING_MODEL") ?? "text-embedding-nomic-embed-text-v1.5";
+
+    var embeddingService = new OpenAiCompatibleEmbeddingService(embeddingApiUrl, embeddingModel);
+
+    // Проверка доступности API
+    Console.WriteLine($"Проверка embedding API ({embeddingApiUrl})...");
+    try 
+    {
+        var available = await embeddingService.CheckAvailabilityAsync();
+        if (!available)
+        {
+            Console.WriteLine($"Embedding API недоступен на {embeddingApiUrl}. Индексация пропущена.");
+            Console.WriteLine("Убедитесь, что API запущен и модель nomic-embed-text доступна.");
+            return;
+        }
+    }
+    catch (Exception ex) 
+    {
+        Console.WriteLine($"Embedding API недоступен: {ex.Message}");
+        Console.WriteLine("Индексация пропущена. Убедитесь, что API запущен на {0}", embeddingApiUrl);
+        return;
+    }
+
+    var extensions = new[] { ".txt", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
+
+    // Индексация: FixedSize
+    Console.WriteLine("\nИндексация: Fixed Size Strategy (chunk=512, overlap=50)");
+    var progress1 = new Progress<double>(p => Console.Write($"\r  Прогресс: {p:P0}"));
+    var pipeline1 = new IndexingPipeline(new FixedSizeChunkingStrategy(512, 50), embeddingService, store);
+    var result1 = await pipeline1.RunAsync(targetDir, extensions, progress1);
+    Console.WriteLine($"\nГотово: {result1.ChunksCreated} чанков из {result1.FilesProcessed} файлов за {result1.Duration.TotalSeconds:F1}с");
+
+    // Индексация: Structural
+    Console.WriteLine("\nИндексация: Structural Strategy");
+    var progress2 = new Progress<double>(p => Console.Write($"\r  Прогресс: {p:P0}"));
+    var pipeline2 = new IndexingPipeline(new StructuralChunkingStrategy(512, 50), embeddingService, store);
+    var result2 = await pipeline2.RunAsync(targetDir, extensions, progress2);
+    Console.WriteLine($"\nГотово: {result2.ChunksCreated} чанков из {result2.FilesProcessed} файлов за {result2.Duration.TotalSeconds:F1}с");
+
+    Console.WriteLine($"\nИндексация завершена. База: {dbPath}");
+    Console.WriteLine($"  FixedSize чанков: {result1.ChunksCreated}");
+    Console.WriteLine($"  Structural чанков: {result2.ChunksCreated}");
+
+    embeddingService.Dispose();
 }
 
 static string NormalizeGitUrl(string url, string? token)

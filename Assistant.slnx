@@ -1,2 +1,4 @@
 <Solution>
+  <Project Path="Libraries/DocIndexer.Core/DocIndexer.Core.csproj" />
+  <Project Path="Assistant/Assistant.csproj" />
 </Solution>
