@@ -2,30 +2,18 @@ using System.Text;
 
 public class PromptBuilder
 {
-    public const string SystemPrompt = @"You are a precise technical assistant answering questions about an indexed software project. 
-Your answers MUST be grounded exclusively in the provided context chunks.
+    private const string BaseSystemPrompt = @"You are a precise technical assistant answering questions about an indexed software project. 
+Your answers MUST be grounded exclusively in the provided context chunks and available tools.
 
 STRICT RULES:
-1. Answer ONLY using information from the provided context chunks.
+1. Answer ONLY using information from the provided context chunks and tool results.
 2. If the context does not contain sufficient information, output JSON with confidence: ""unknown"".
-3. Every factual claim MUST be backed by a citation from the context.
+3. Every factual claim MUST be backed by a citation from the context or tool result.
 4. Citations must be EXACT substrings (30-200 chars) from the context — no paraphrasing.
 5. NEVER fabricate sources, citations, or facts not present in the context.
-6. Respond in the same language as the user's question.
-7. Output RAW JSON only. Do NOT wrap in markdown code blocks (no ```json).
+6. Respond in the same language as the user's question.";
 
-OUTPUT FORMAT — strict JSON with these exact keys:
-{
-  ""answer"": ""<comprehensive answer with inline [CITATION:0], [CITATION:1] markers>"",
-  ""confidence"": ""<high|medium|low|unknown>"",
-  ""sources"": [
-    { ""index"": 0, ""source"": ""<file path>"", ""section"": ""<section name>"", ""chunk_id"": ""<uuid>"", ""score"": 0.85 }
-  ],
-  ""citations"": [
-    { ""index"": 0, ""quote"": ""<exact text from chunk>"", ""source_index"": 0 }
-  ],
-  ""clarification_request"": ""<if confidence=unknown, ask user to clarify>""
-}";
+    public static string BuildSystemPrompt() => BaseSystemPrompt;
 
     public static string BuildUserPrompt(string question, List<ScoredChunk> chunks, ConfidenceLevel confidence)
     {

@@ -217,7 +217,6 @@ static async Task RunChatAsync(string targetDir, string dbPath)
     try 
     {
         llm = new OpenAiCompatibleLlmService(llmApiUrl, llmModel, llmApiKey, 4096);
-        // Quick connectivity check by making a minimal request
         var testPrompt = "Respond with exactly: OK";
         await llm.AskAsync(testPrompt, "You are a test assistant. Respond with exactly 'OK' and nothing else.", 10);
         Console.ForegroundColor = ConsoleColor.Green;
@@ -234,15 +233,51 @@ static async Task RunChatAsync(string targetDir, string dbPath)
         return;
     }
 
+    var targetDirFull = Path.GetFullPath(targetDir);
+
+    McpGitClient? mcpClient = null;
+    try 
+    {
+        Console.WriteLine("Подключение к MCP Git server...");
+        mcpClient = await McpGitClient.ConnectAsync(targetDirFull);
+        
+        // Verify MCP tools are available (OpenAI Function Calling integration)
+        var toolDefs = await mcpClient.GetMcpToolsDefinitionsAsync();
+        if (toolDefs == null || toolDefs.Count == 0)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("⚠️  MCP Git server connected but no tools available.");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"✅ MCP Git server connected with {toolDefs.Count} tools (OpenAI Function Calling API)\n");
+            Console.ResetColor();
+        }
+    }
+    catch (Exception ex) 
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"⚠️  MCP Git server not available: {ex.Message}");
+        Console.WriteLine("Chat will work without git tools. Ensure 'uvx' is installed.");
+        Console.ResetColor();
+    }
+
     var extensions = new[] { ".txt", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
 
     var rewrite = new HeuristicQueryRewriteService();
     var rag = new EnhancedRagPipeline(embeddingService, store, rewrite);
     var validator = new CitationValidator();
-    var chat = new ChatService(llm, rag, validator);
+    var chat = new ChatService(llm, rag, validator, mcpClient);
 
     try { await chat.RunInteractiveAsync(); }
-    finally { llm.Dispose(); embeddingService.Dispose(); }
+    finally 
+    { 
+        llm.Dispose(); 
+        embeddingService.Dispose(); 
+        if (mcpClient != null) await mcpClient.DisposeAsync();
+    }
 }
 
 static string NormalizeGitUrl(string url, string? token)

@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 public class OpenAiCompatibleLlmService : ILlmService
@@ -54,6 +55,79 @@ public class OpenAiCompatibleLlmService : ILlmService
         return result;
     }
 
+    public async Task<ToolCallResult?> AskWithToolsAsync(
+        string userMessage,
+        string? systemPrompt = null,
+        IEnumerable<ToolDefinition>? tools = null,
+        int? maxTokens = null,
+        CancellationToken ct = default)
+    {
+        var messages = new List<ChatMessage>();
+
+        if (!string.IsNullOrEmpty(systemPrompt))
+            messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+
+        messages.Add(new ChatMessage { Role = "user", Content = userMessage });
+
+        var request = new ChatRequest
+        {
+            Model = _model,
+            Messages = messages,
+            MaxTokens = maxTokens ?? _defaultMaxTokens,
+            Stream = false,
+            Temperature = 0.2,
+            TopP = 0.9,
+            Tools = tools?.Select(t => new ChatTool { Type = "function", Function = new ChatFunction { Name = t.Name, Description = t.Description, Parameters = t.InputSchema ?? GetDefaultSchema(t.Name) } }).ToList(),
+            ToolChoice = "auto",
+        };
+
+        var response = await SendToolResponseAsync(request, ct);
+        
+        if (response == null)
+            return new ToolCallResult(Content: "", ToolCalls: []);
+
+        var content = response.Choices?.FirstOrDefault()?.Message;
+        
+        return new ToolCallResult(
+            Content: content?.Content ?? "",
+            ToolCalls: (content?.ToolCalls ?? []).Select(tc => new ToolCall(
+                Id: tc.Id,
+                Name: tc.Function?.Name ?? "",
+                Arguments: ParseToolArguments(tc.Function?.Arguments)
+            )).ToList()
+        );
+    }
+
+    private static object GetDefaultSchema(string toolName) => new { type = "object", properties = (object)new {} };
+
+    private static Dictionary<string, object?> ParseToolArguments(string? argsJson)
+    {
+        if (string.IsNullOrEmpty(argsJson))
+            return new Dictionary<string, object?>();
+
+        try 
+        {
+            using var doc = JsonDocument.Parse(argsJson);
+            var result = new Dictionary<string, object?>();
+            
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (prop.Value.ValueKind == JsonValueKind.Array)
+                    result[prop.Name] = prop.Value.EnumerateArray().Select(v => v.ToString()).ToList();
+                else if (prop.Value.ValueKind == JsonValueKind.Object)
+                    result[prop.Name] = prop.Value.ToString();
+                else
+                    result[prop.Name] = prop.Value.ToString();
+            }
+
+            return result;
+        }
+        catch 
+        {
+            return new Dictionary<string, object?>();
+        }
+    }
+
     private async Task<string> SendWithRetryAsync(ChatRequest request, CancellationToken ct)
     {
         var maxRetries = 3;
@@ -73,6 +147,30 @@ public class OpenAiCompatibleLlmService : ILlmService
                     throw new InvalidOperationException("Empty response from LLM");
 
                 return content;
+            }
+            catch (Exception ex) when (attempt < maxRetries && (ex is HttpRequestException or TaskCanceledException))
+            {
+                if (ct.IsCancellationRequested) throw;
+                await Task.Delay(delay * attempt, ct);
+            }
+        }
+
+        throw new HttpRequestException("Failed to get LLM response after 3 retries");
+    }
+
+    private async Task<ChatResponse?> SendToolResponseAsync(ChatRequest request, CancellationToken ct)
+    {
+        var maxRetries = 3;
+        var delay = 1000;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var response = await _httpClient.PostAsJsonAsync("/v1/chat/completions", request, ct);
+                response.EnsureSuccessStatusCode();
+
+                return await response.Content.ReadFromJsonAsync<ChatResponse>(ct);
             }
             catch (Exception ex) when (attempt < maxRetries && (ex is HttpRequestException or TaskCanceledException))
             {
@@ -115,6 +213,12 @@ public class OpenAiCompatibleLlmService : ILlmService
         
         [JsonPropertyName("top_k")]
         public int TopK { get; set; }
+
+        [JsonPropertyName("tools")]
+        public List<ChatTool>? Tools { get; set; }
+
+        [JsonPropertyName("tool_choice")]
+        public string? ToolChoice { get; set; } = "auto";
     }
 
     private class ChatMessage
@@ -123,7 +227,58 @@ public class OpenAiCompatibleLlmService : ILlmService
         public string Role { get; set; } = "";
 
         [JsonPropertyName("content")]
-        public string Content { get; set; } = "";
+        public string? Content { get; set; } = "";
+
+        [JsonPropertyName("tool_calls")]
+        public List<ToolCallData>? ToolCalls { get; set; }
+
+        [JsonPropertyName("tool_call_id")]
+        public string? ToolCallId { get; set; }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+    }
+
+    private class ChatTool
+    {
+        [JsonPropertyName("type")]
+        public string Type { get; set; } = "function";
+
+        [JsonPropertyName("function")]
+        public ChatFunction? Function { get; set; }
+    }
+
+    private class ChatFunction
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = "";
+
+        [JsonPropertyName("description")]
+        public string? Description { get; set; }
+
+        [JsonPropertyName("parameters")]
+        public object? Parameters { get; set; }
+    }
+
+    private class ToolCallData
+    {
+        [JsonPropertyName("id")]
+        public string? Id { get; set; }
+
+        [JsonPropertyName("type")]
+        public string Type { get; set; } = "function";
+
+        [JsonPropertyName("function")]
+        public FunctionCall? Function { get; set; }
+    }
+
+    private class FunctionCall
+    {
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("arguments")]
+        public string? Arguments { get; set; }
     }
 
     private class ChatResponse
