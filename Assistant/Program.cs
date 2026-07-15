@@ -5,7 +5,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 
 const string Usage = """
-Assistant <repository-url> [target-directory] [--chat | --review --project-id <id> --merge-request-iid <iid>]
+Assistant <repository-url> [target-directory] [--chat [--project-id <id>]] [--review --project-id <id> --merge-request-iid <iid>]
 
 Clones a Git repository at startup, then indexes the cloned content.
 With --chat flag: starts interactive RAG chat with a local LLM after indexing.
@@ -18,7 +18,7 @@ Arguments:
 Flags:
   --chat                    Start interactive RAG chat mode after indexing
   --review                  Enable automated code review mode (one-shot)
-  --project-id <value>      GitLab project ID (required with --review)
+  --project-id <value>      GitLab project ID (used with --chat or --review)
   --merge-request-iid <val> Merge request IID (required with --review)
 
 Environment variables:
@@ -104,6 +104,11 @@ if (runReview)
     return;
 }
 
+if (runChat && !string.IsNullOrWhiteSpace(projectId))
+{
+    Console.WriteLine($"Project ID: {projectId}");
+}
+
 var isHttps = repoUrl.StartsWith("https://", StringComparison.Ordinal);
 string? token = null;
 
@@ -129,7 +134,7 @@ if (isCloned)
     Console.WriteLine($"Repository already cloned to: {targetDir}");
 
     // === ИНДЕКСАЦИЯ (пропускаем клонирование) ===
-    await RunIndexingAsync(targetDir, runChat, resolvedTargetDir);
+    await RunIndexingAsync(targetDir, runChat, resolvedTargetDir, projectId);
 }
 else
 {
@@ -186,7 +191,7 @@ else
             Console.WriteLine(output);
 
         // === ИНДЕКСАЦИЯ (после успешного git clone) ===
-        await RunIndexingAsync(targetDir, runChat, resolvedTargetDir);
+        await RunIndexingAsync(targetDir, runChat, resolvedTargetDir, projectId);
     }
     else
     {
@@ -199,7 +204,7 @@ else
     }
 }
 
-static async Task RunIndexingAsync(string targetDir, bool runChat, string resolvedTargetDir)
+static async Task RunIndexingAsync(string targetDir, bool runChat, string resolvedTargetDir, string? projectId)
 {
     var dbPath = Path.Combine(Path.GetFullPath(targetDir), "document_index.db");
 
@@ -210,7 +215,7 @@ static async Task RunIndexingAsync(string targetDir, bool runChat, string resolv
         if (runChat)
         {
             Console.WriteLine("\n=== Запуск интерактивного чата ===");
-            await RunChatAsync(targetDir, dbPath, resolvedTargetDir);
+            await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId);
         }
 
         return;
@@ -270,11 +275,11 @@ static async Task RunIndexingAsync(string targetDir, bool runChat, string resolv
     if (runChat)
     {
         Console.WriteLine("\n=== Запуск интерактивного чата ===");
-        await RunChatAsync(targetDir, dbPath, resolvedTargetDir);
+        await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId);
     }
 }
 
-static async Task RunChatAsync(string targetDir, string dbPath, string resolvedTargetDir)
+static async Task RunChatAsync(string targetDir, string dbPath, string resolvedTargetDir, string? projectId)
 {
     var store = new SqliteVectorStore(dbPath);
     await store.InitializeAsync();
@@ -340,15 +345,15 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
     ChatService chat;
     if (mcpManager != null && mcpManager.IsConnected)
     {
-        chat = new ChatService(llm, rag, validator, mcpManager, resolvedTargetDir);
+        chat = new ChatService(llm, rag, validator, mcpManager, resolvedTargetDir, projectId);
     }
     else if (rag != null)
     {
-        chat = new ChatService(llm, rag, validator);
+        chat = new ChatService(llm, rag, validator, projectId: projectId);
     }
     else
     {
-        chat = new ChatService(llm, mcpManager);
+        chat = new ChatService(llm, mcpManager, projectId: projectId);
     }
 
     try { await chat.RunInteractiveAsync(); }

@@ -17,10 +17,13 @@ public class ChatService
     // Path to the cloned repository (for LLM awareness)
     private readonly string? _repoPath;
 
+    // GitLab project ID (for LLM awareness in chat mode)
+    private readonly string? _projectId;
+
     public ChatService(
         ILlmService llm,
         EnhancedRagPipeline rag,
-        CitationValidator validator) : this(llm, rag: rag, validator: validator, mcpManager: null, repoPath: null)
+        CitationValidator validator) : this(llm, rag: rag, validator: validator, mcpManager: null, repoPath: null, projectId: null)
     {
         _llm = llm;
         _rag = rag;
@@ -31,7 +34,7 @@ public class ChatService
         ILlmService llm,
         EnhancedRagPipeline rag,
         CitationValidator validator,
-        McpServerManager mcpManager) : this(llm, rag: rag, validator: validator, mcpManager: mcpManager, repoPath: null)
+        McpServerManager mcpManager) : this(llm, rag: rag, validator: validator, mcpManager: mcpManager, repoPath: null, projectId: null)
     {
         _mcpManager = mcpManager;
 
@@ -41,7 +44,8 @@ public class ChatService
 
     public ChatService(
         ILlmService llm,
-        McpServerManager mcpManager) : this(llm, null, validator: null, mcpManager: mcpManager, repoPath: null)
+        McpServerManager mcpManager,
+        string? projectId = null) : this(llm, null, validator: null, mcpManager: mcpManager, repoPath: null, projectId: projectId)
     {
         _llm = llm;
 
@@ -51,19 +55,32 @@ public class ChatService
 
     public ChatService(
         ILlmService llm,
-        EnhancedRagPipeline? rag,
-        CitationValidator? validator,
-        McpServerManager? mcpManager,
-        string? repoPath)
+        EnhancedRagPipeline rag,
+        CitationValidator validator,
+        McpServerManager mcpManager,
+        string? repoPath,
+        string? projectId = null)
     {
         _llm = llm;
         _rag = rag;
         _validator = validator;
         _mcpManager = mcpManager;
         _repoPath = repoPath;
+        _projectId = projectId;
 
         if (mcpManager?.IsConnected == true && mcpManager.Tools != null)
             Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count} (серверов: {mcpManager.ServerCount})");
+    }
+
+    public ChatService(
+        ILlmService llm,
+        EnhancedRagPipeline rag,
+        CitationValidator validator,
+        string? projectId = null) : this(llm, rag: rag, validator: validator, mcpManager: null, repoPath: null, projectId: projectId)
+    {
+        _llm = llm;
+        _rag = rag;
+        _validator = validator;
     }
 
     public string? RepoPath => _repoPath;
@@ -190,11 +207,17 @@ public class ChatService
             effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
         }
 
+        // Inform LLM about the GitLab project ID
+        if (!string.IsNullOrEmpty(_projectId))
+        {
+            effectiveSystemPrompt += $"\n\n[PROJECT ID: {_projectId}]";
+        }
+
         var messages = new List<Dictionary<string, object>>();
         messages.Add(new Dictionary<string, object> { ["role"] = "system", ["content"] = effectiveSystemPrompt });
 
         var userMessageContent = ragResult != null ? BuildUserMessageWithChunks(userPrompt) : userPrompt;
-        messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessageContent});
+        messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessageContent });
 
         var currentRagResult = ragResult;
         CitationAnswer? lastParsedAnswer = null;
@@ -485,6 +508,12 @@ public class ChatService
                 if (!string.IsNullOrEmpty(_repoPath))
                 {
                     effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
+                }
+
+                // Inform LLM about the GitLab project ID
+                if (!string.IsNullOrEmpty(_projectId))
+                {
+                    effectiveSystemPrompt += $"\n\n[PROJECT ID: {_projectId}]";
                 }
 
                 var rawResponse = await _llm.AskAsync(userPrompt, effectiveSystemPrompt, MaxTokens, ct);
