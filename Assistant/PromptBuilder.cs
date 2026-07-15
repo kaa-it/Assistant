@@ -27,6 +27,14 @@ OUTPUT FORMAT — strict JSON with these exact keys:
   ""clarification_request"": ""<if confidence=unknown, ask user to clarify>""
 }";
 
+    public const string FallbackSystemPrompt = @"You are a precise technical assistant answering questions about an indexed software project.
+No relevant documentation context was found for this query in the RAG index.
+
+IMPORTANT: You have access to MCP tools that are listed below in the [AVAILABLE TOOLS] section.
+Use the appropriate tool to gather information and provide a concrete answer.
+
+Do NOT output confidence='unknown'. Gather facts using available tools and respond with an answer.";
+
     public static string BuildUserPrompt(string question, List<ScoredChunk> chunks, ConfidenceLevel confidence)
     {
         var sb = new StringBuilder();

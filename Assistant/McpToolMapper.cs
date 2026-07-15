@@ -1,61 +1,82 @@
 using System.Text.Json;
-using MCPSharp;
-using MCPSharp.Model;
-using MCPSharp.Model.Schemas;
-using MCPSharp.Model.Results;
-using OpenAI.Chat;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
 
 public static class McpToolMapper
 {
-    public static List<ChatTool> ToOpenAITools(IEnumerable<Tool> mcpTools)
+    public static List<Dictionary<string, object>> BuildTools(IList<McpClientTool> mcpTools)
     {
-        var openAiTools = new List<ChatTool>();
+        var tools = new List<Dictionary<string, object>>();
 
         foreach (var mcpTool in mcpTools)
         {
-            var parameters = MapSchemaToBinaryData(mcpTool.InputSchema);
-            openAiTools.Add(ChatTool.CreateFunctionTool(
-                functionName: mcpTool.Name,
-                functionDescription: mcpTool.Description ?? "",
-                functionParameters: parameters));
+            var toolObj = new Dictionary<string, object>
+            {
+                ["type"] = "function",
+                ["function"] = new Dictionary<string, object>
+                {
+                    ["name"] = mcpTool.Name,
+                    ["description"] = mcpTool.Description ?? ""
+                }
+            };
+
+            var parameters = MapSchemaToDictionary(mcpTool.JsonSchema);
+            ((Dictionary<string, object>)toolObj["function"])["parameters"] = parameters;
+
+            tools.Add(toolObj);
         }
 
-        return openAiTools;
+        return tools;
     }
 
-    private static BinaryData MapSchemaToBinaryData(InputSchema? schema)
+    public static Dictionary<string, object> MapSchemaToDictionary(JsonElement jsonSchema)
     {
-        if (schema == null)
-            return BinaryData.FromString("""{"type":"object","properties":{}}""");
+        if (jsonSchema.ValueKind == JsonValueKind.Null || jsonSchema.ValueKind != JsonValueKind.Object)
+            return new Dictionary<string, object> { ["type"] = "object", ["properties"] = new Dictionary<string, object>() };
+
+        var schemaObj = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(jsonSchema.GetRawText())
+            ?? new Dictionary<string, JsonElement>();
 
         var properties = new Dictionary<string, object>();
         var requiredList = new List<string>();
 
-        if (schema.Properties != null)
+        if (schemaObj.TryGetValue("properties", out var propsElement) &&
+            propsElement.ValueKind == JsonValueKind.Object)
         {
-            foreach (var prop in schema.Properties)
+            foreach (var prop in propsElement.EnumerateObject())
             {
-                properties[prop.Key] = new Dictionary<string, object>
-                {
-                    ["type"] = MapTypeToOpenAI(prop.Value.Type),
-                    ["description"] = prop.Value.Description ?? ""
-                };
+                var propObj = new Dictionary<string, object>();
 
-                if (prop.Value.Required)
-                    requiredList.Add(prop.Key);
+                if (prop.Value.TryGetProperty("type", out var typeProp))
+                    propObj["type"] = MapTypeToOpenAI(typeProp.GetString() ?? "string");
+
+                if (prop.Value.TryGetProperty("description", out var descProp) && !string.IsNullOrEmpty(descProp.GetString()))
+                    propObj["description"] = descProp.GetString();
+
+                properties[prop.Name] = propObj;
             }
         }
 
-        var schemaObj = new Dictionary<string, object>
+        if (schemaObj.TryGetValue("required", out var reqElement) &&
+            reqElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var req in reqElement.EnumerateArray())
+            {
+                if (req.GetString() is string r)
+                    requiredList.Add(r);
+            }
+        }
+
+        var result = new Dictionary<string, object>
         {
             ["type"] = "object",
             ["properties"] = properties,
         };
 
         if (requiredList.Count > 0)
-            schemaObj["required"] = requiredList;
+            result["required"] = requiredList;
 
-        return BinaryData.FromObjectAsJson(schemaObj);
+        return result;
     }
 
     private static string MapTypeToOpenAI(string mcpType)
@@ -82,7 +103,16 @@ public static class McpToolMapper
         return ParseJsonElement(doc.RootElement);
     }
 
-    private static Dictionary<string, object> ParseJsonElement(JsonElement element)
+    public static Dictionary<string, object> ParseToolCallArguments(string arguments)
+    {
+        if (string.IsNullOrEmpty(arguments))
+            return new Dictionary<string, object>();
+
+        using var doc = JsonDocument.Parse(arguments);
+        return ParseJsonElement(doc.RootElement);
+    }
+
+    public static Dictionary<string, object> ParseJsonElement(JsonElement element)
     {
         var result = new Dictionary<string, object>();
 
@@ -94,7 +124,7 @@ public static class McpToolMapper
         return result;
     }
 
-    private static object JsonValueToCSharp(JsonElement element)
+    public static object JsonValueToCSharp(JsonElement element)
     {
         return element.ValueKind switch
         {
@@ -112,15 +142,19 @@ public static class McpToolMapper
 
     public static string FormatToolResult(CallToolResult result)
     {
-        if (result.Content == null || result.Content.Length == 0)
+        if (result.Content == null || !result.Content.Any())
             return "(no content)";
 
-        var textParts = result.Content.Where(c => !result.IsError).Select(c => c.Text ?? "").ToList();
-        var errorParts = result.Content.Where(c => c.Text != null).Select(c => c.Text!).ToList();
-
-        if (result.IsError)
+        var textParts = new List<string>();
+        foreach (var content in result.Content)
         {
-            return "Error executing tool: " + string.Join("; ", errorParts);
+            if (content is TextContentBlock textContent)
+                textParts.Add(textContent.Text ?? "");
+        }
+
+        if (result.IsError == true)
+        {
+            return "Error executing tool: " + string.Join("; ", textParts);
         }
 
         return string.Join("\n", textParts);

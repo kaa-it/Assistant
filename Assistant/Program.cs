@@ -258,7 +258,8 @@ static async Task RunChatAsync(string targetDir, string dbPath)
     try { await chat.RunInteractiveAsync(); }
     finally
     {
-        mcpManager?.Dispose();
+        if (mcpManager != null)
+            await mcpManager.DisposeAsync();
         llm.Dispose();
         embeddingService.Dispose();
     }
