@@ -36,7 +36,7 @@ public class ChatService
         _mcpManager = mcpManager;
 
         if (mcpManager.IsConnected && mcpManager.Tools != null)
-            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
+            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count} (серверов: {mcpManager.ServerCount})");
     }
 
     public ChatService(
@@ -46,7 +46,7 @@ public class ChatService
         _llm = llm;
 
         if (mcpManager.IsConnected && mcpManager.Tools != null)
-            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
+            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count} (серверов: {mcpManager.ServerCount})");
     }
 
     public ChatService(
@@ -63,7 +63,7 @@ public class ChatService
         _repoPath = repoPath;
 
         if (mcpManager?.IsConnected == true && mcpManager.Tools != null)
-            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
+            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count} (серверов: {mcpManager.ServerCount})");
     }
 
     public string? RepoPath => _repoPath;
@@ -165,16 +165,16 @@ public class ChatService
         if (ragResult == null)
         {
             // Check if this is a non-RAG mode (no _rag instance) vs RAG mode with unknown result
-            if (_rag == null)
-            {
+            // if (_rag == null)
+            // {
                 // Non-RAG mode: use MCP-only prompt (no RAG references)
                 effectiveSystemPrompt = PromptBuilder.McpOnlySystemPrompt;
-            }
-            else
-            {
-                // RAG mode with unknown result: use fallback prompt (mentions indexed project)
-                effectiveSystemPrompt = PromptBuilder.FallbackSystemPrompt;
-            }
+            // }
+            // else
+            // {
+            //     // RAG mode with unknown result: use fallback prompt (mentions indexed project)
+            //     effectiveSystemPrompt = PromptBuilder.FallbackSystemPrompt;
+            // }
         }
 
         // Embed MCP tools into the system prompt for native chat template support

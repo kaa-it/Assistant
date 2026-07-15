@@ -48,7 +48,8 @@ public static class ToolPromptBuilder
                 }
             };
 
-            var parameters = MapSchemaToDictionary(mcpTool.JsonSchema);
+            var parameters = mcpTool.JsonSchema.GetRawText();
+
             ((Dictionary<string, object>)toolObj["function"])["parameters"] = parameters;
 
             sb.Append(JsonSerializer.Serialize(toolObj));
@@ -79,13 +80,10 @@ public static class ToolPromptBuilder
         if (jsonSchema.ValueKind == JsonValueKind.Null || jsonSchema.ValueKind != JsonValueKind.Object)
             return new Dictionary<string, object> { ["type"] = "object", ["properties"] = new Dictionary<string, object>() };
 
-        var schemaObj = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(jsonSchema.GetRawText())
-            ?? new Dictionary<string, JsonElement>();
-
         var properties = new Dictionary<string, object>();
         var requiredList = new List<string>();
 
-        if (schemaObj.TryGetValue("properties", out var propsElement) &&
+        if (jsonSchema.TryGetProperty("properties", out var propsElement) &&
             propsElement.ValueKind == JsonValueKind.Object)
         {
             foreach (var prop in propsElement.EnumerateObject())
@@ -98,11 +96,25 @@ public static class ToolPromptBuilder
                 if (prop.Value.TryGetProperty("description", out var descProp) && !string.IsNullOrEmpty(descProp.GetString()))
                     propObj["description"] = descProp.GetString();
 
+                // Handle array-type properties: copy "items" schema as raw JSON string
+                if (prop.Value.TryGetProperty("items", out var itemsProp) &&
+                    propObj.TryGetValue("type", out var typeVal) && (string)typeVal == "array")
+                {
+                    propObj["items"] = MapJsonElementToValue(itemsProp, McpToolMapper.ParseJsonElement);
+                }
+
+                // Handle object-type properties: copy "additionalProperties" as raw JSON string
+                if (prop.Value.TryGetProperty("additionalProperties", out var addPropsProp) &&
+                    propObj.TryGetValue("type", out var typeVal2) && (string)typeVal2 == "object")
+                {
+                    propObj["additionalProperties"] = MapJsonElementToValue(addPropsProp, McpToolMapper.ParseJsonElement);
+                }
+
                 properties[prop.Name] = propObj;
             }
         }
 
-        if (schemaObj.TryGetValue("required", out var reqElement) &&
+        if (jsonSchema.TryGetProperty("required", out var reqElement) &&
             reqElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var req in reqElement.EnumerateArray())
@@ -120,6 +132,23 @@ public static class ToolPromptBuilder
 
         return result;
     }
+
+    private static object MapJsonElementToValue(JsonElement element, Func<JsonElement, Dictionary<string, object>> parseFn)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Object => parseFn(element),
+            JsonValueKind.Array => element.EnumerateArray().Select(e => (object)JsonValueToCSharp(e)).ToList(),
+            JsonValueKind.String => element.GetString() ?? "",
+            JsonValueKind.Number when element.TryGetInt32(out var i) => i,
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Null => null!,
+            _ => element.ToString()
+        };
+    }
+
+    private static object JsonValueToCSharp(JsonElement element) => McpToolMapper.JsonValueToCSharp(element);
 
     private static string MapTypeToOpenAI(string mcpType)
     {

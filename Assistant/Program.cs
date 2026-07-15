@@ -21,6 +21,8 @@ Environment variables:
   LLM_API_URL                  LLM API URL (default: http://localhost:1234)
   LLM_API_KEY                  LLM API key (optional)
   LLM_MODEL                    LLM model name (default: qwen/qwen3.6-35b-a3b)
+  GITLAB_PERSONAL_ACCESS_TOKEN Personal Access Token for GitLab MCP server (optional)
+  GITLAB_API_URL               Base URL for GitLab API, e.g. https://gitlab.example.com/api/v4 (optional)
 
 Examples:
   dotnet run -- git@gitserver.local.yurion.ru:andreyk/rust-design-patterns.git
@@ -269,10 +271,21 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
     McpServerManager? mcpManager = null;
     try
     {
-        var mcpCommand = "uvx";
-        var mcpArgs = new[] { "mcp-server-git" };
+        mcpManager = new McpServerManager();
 
-        mcpManager = new McpServerManager(mcpCommand, mcpArgs);
+        // Git MCP server (uvx)
+        mcpManager.AddServer("git", "uvx", new[] { "mcp-server-git" });
+
+        // GitLab MCP server (direct executable)
+        var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
+        var gitlabApiUrl  = Environment.GetEnvironmentVariable("GITLAB_API_URL");
+
+        if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+        {
+            mcpManager.AddServer("zereight-mcp-gitlab", "zereight-mcp-gitlab",
+                new[] { "--token=" + gitlabToken, "--api-url=" + gitlabApiUrl });
+        }
+
         await mcpManager.ConnectAsync();
     }
     catch { /* MCP connection is optional, continue without it */ }

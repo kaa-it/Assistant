@@ -20,7 +20,8 @@ public static class McpToolMapper
                 }
             };
 
-            var parameters = MapSchemaToDictionary(mcpTool.JsonSchema);
+            var parameters = mcpTool.JsonSchema.GetRawText();
+
             ((Dictionary<string, object>)toolObj["function"])["parameters"] = parameters;
 
             tools.Add(toolObj);
@@ -34,13 +35,10 @@ public static class McpToolMapper
         if (jsonSchema.ValueKind == JsonValueKind.Null || jsonSchema.ValueKind != JsonValueKind.Object)
             return new Dictionary<string, object> { ["type"] = "object", ["properties"] = new Dictionary<string, object>() };
 
-        var schemaObj = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(jsonSchema.GetRawText())
-            ?? new Dictionary<string, JsonElement>();
-
         var properties = new Dictionary<string, object>();
         var requiredList = new List<string>();
 
-        if (schemaObj.TryGetValue("properties", out var propsElement) &&
+        if (jsonSchema.TryGetProperty("properties", out var propsElement) &&
             propsElement.ValueKind == JsonValueKind.Object)
         {
             foreach (var prop in propsElement.EnumerateObject())
@@ -53,11 +51,25 @@ public static class McpToolMapper
                 if (prop.Value.TryGetProperty("description", out var descProp) && !string.IsNullOrEmpty(descProp.GetString()))
                     propObj["description"] = descProp.GetString();
 
+                // Handle array-type properties: copy "items" schema as raw JSON
+                if (prop.Value.TryGetProperty("items", out var itemsProp) &&
+                    propObj.TryGetValue("type", out var typeVal) && (string)typeVal == "array")
+                {
+                    propObj["items"] = MapJsonElementToValue(itemsProp);
+                }
+
+                // Handle object-type properties: copy "additionalProperties" as raw JSON
+                if (prop.Value.TryGetProperty("additionalProperties", out var addPropsProp) &&
+                    propObj.TryGetValue("type", out var typeVal2) && (string)typeVal2 == "object")
+                {
+                    propObj["additionalProperties"] = MapJsonElementToValue(addPropsProp);
+                }
+
                 properties[prop.Name] = propObj;
             }
         }
 
-        if (schemaObj.TryGetValue("required", out var reqElement) &&
+        if (jsonSchema.TryGetProperty("required", out var reqElement) &&
             reqElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var req in reqElement.EnumerateArray())
@@ -77,6 +89,21 @@ public static class McpToolMapper
             result["required"] = requiredList;
 
         return result;
+    }
+
+    private static object MapJsonElementToValue(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Object => ParseJsonElement(element),
+            JsonValueKind.Array => element.EnumerateArray().Select(e => (object)JsonValueToCSharp(e)).ToList(),
+            JsonValueKind.String => element.GetString() ?? "",
+            JsonValueKind.Number when element.TryGetInt32(out var i) => i,
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Null => null!,
+            _ => element.ToString()
+        };
     }
 
     private static string MapTypeToOpenAI(string mcpType)
