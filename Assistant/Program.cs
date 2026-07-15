@@ -431,7 +431,7 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
 
             // Try LLM tool-calling first (LLM decides to call the tool)
             var llmResult = await InvokeReviewToolCallViaLlmAsync(
-                llmApiUrl, llmModel, llmApiKey, projectId, mergeRequestIid);
+                llmApiUrl, llmModel, llmApiKey, mcpManager, projectId, mergeRequestIid);
 
             // If LLM returned a tool call (null result), execute via MCP directly
             if (llmResult == null)
@@ -607,10 +607,11 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
 
     Console.WriteLine("=== CODE REVIEW: MR #" + mergeRequestIid + " ===\n");
 
+    string? cleaned = null;
     try
     {
         var reviewAnswer = await llm.AskAsync(finalUserPrompt, systemPrompt, 20000);
-        var cleaned = CleanReviewResponse(reviewAnswer);
+        cleaned = CleanReviewResponse(reviewAnswer);
 
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine("=== CODE REVIEW: MR #" + mergeRequestIid + " ===");
@@ -644,6 +645,30 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
         Console.ResetColor();
     }
 
+    // Step 7: Post review comment to GitLab MR via MCP tool (create_merge_request_note)
+    if (!string.IsNullOrEmpty(cleaned) && mcpManager != null && mcpManager.IsConnected)
+    {
+        try
+        {
+            Console.WriteLine("\n=== Публикация комментария ревью в GitLab MR ===");
+
+            var posted = await PostReviewCommentViaMcpAsync(
+                llmApiUrl, llmModel, llmApiKey, 
+                mcpManager, projectId, mergeRequestIid, cleaned);
+
+            if (posted)
+                Console.WriteLine("Комментарий ревью успешно опубликован в GitLab MR.");
+            else
+                Console.WriteLine("Не удалось опубликовать комментарий — LLM не вернул корректный вызов инструмента.");
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"Предупреждение: не удалось опубликовать комментарий в GitLab: {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
     llm.Dispose();
 
     if (mcpManager != null)
@@ -652,14 +677,19 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
 
 static async Task<string?> InvokeReviewToolCallViaLlmAsync(
     string llmApiUrl, string llmModel, string? llmApiKey, 
+    McpServerManager mcpManager,
     string projectId, string mergeRequestIid)
 {
-    using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
+    using var httpClient = new HttpClient
+    {
+        BaseAddress = new Uri(llmApiUrl),
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     if (!string.IsNullOrEmpty(llmApiKey))
         httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", llmApiKey);
 
-    var systemPrompt = "You are a code review assistant. You have access to MCP tools via the chat template. When asked to get merge request diffs, call the tool 'get_merge_request_diffs' with parameters project_id and merge_request_iid. Return only the tool call, not a text answer.";
+    var systemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools("", mcpManager.Tools ?? []);
 
     var userMessage = $"Please get the merge request diffs for project_id='{projectId}' and merge_request_iid='{mergeRequestIid}'. Call the tool 'get_merge_request_diffs' with these parameters.";
 
@@ -667,76 +697,208 @@ static async Task<string?> InvokeReviewToolCallViaLlmAsync(
     messages.Add(new Dictionary<string, object> { ["role"] = "system", ["content"] = systemPrompt });
     messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessage });
 
-    var request = new Dictionary<string, object>
+    const int maxRetries = 3;
+    
+    for (int attempt = 1; attempt <= maxRetries; attempt++)
     {
-        ["model"] = llmModel,
-        ["messages"] = messages,
-    };
-
-    request["max_tokens"] = 2048;
-    request["stream"] = false;
-    request["temperature"] = 0.1;
-
-    var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request);
-    response.EnsureSuccessStatusCode();
-
-    var result = await response.Content.ReadFromJsonAsync<QwenChatResponseForReview>();
-    var choice = result?.Choices?.FirstOrDefault();
-
-    if (choice == null) throw new InvalidOperationException("Empty LLM response for tool call invocation.");
-
-    var assistantMsg = choice.Message;
-    string? content = assistantMsg?.Content;
-    List<QwenToolCallForReview>? toolCalls = assistantMsg?.ToolCalls ?? [];
-
-    // Try native OpenAI-style tool_calls first
-    if (toolCalls != null && toolCalls.Count > 0)
-    {
-        var tc = toolCalls[0];
-        Console.WriteLine($"LLM вернул инструмент: {tc.Function?.Name}");
-
-        // LLM returned a tool call — signal to caller that it should execute via MCP
-        return null; // signals: "execute get_merge_request_diffs via MCP manager"
-    }
-
-    // Try XML/backtick-style tool call blocks in response (qwen3.6 format)
-    if (!string.IsNullOrEmpty(content))
-    {
-        var patterns = new[]
+        var request = new Dictionary<string, object>
         {
-            new Regex(@"\u3400\n?(?<json>[\s\S]*?)\n?\u3401", RegexOptions.Compiled)
+            ["model"] = llmModel,
+            ["messages"] = messages,
         };
 
-        foreach (var pattern in patterns)
+        request["max_tokens"] = 2048;
+        request["stream"] = false;
+        request["temperature"] = 0.1;
+
+        var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request);
+        response.EnsureSuccessStatusCode();
+
+        var result = await response.Content.ReadFromJsonAsync<QwenChatResponse>();
+        var choice = result?.Choices?.FirstOrDefault();
+
+        if (choice == null) continue;
+
+        var assistantMsg = choice.Message;
+        string? content = assistantMsg?.Content;
+        List<QwenToolCall>? toolCalls = assistantMsg?.ToolCalls ?? [];
+
+        // Try native OpenAI-style tool_calls
+        if (toolCalls != null && toolCalls.Count > 0)
         {
-            var matches = pattern.Matches(content);
-
-            foreach (Match match in matches)
+            foreach (var tc in toolCalls)
             {
-                var rawJson = match.Groups["json"].Value.Trim();
+                var funcName = tc.Function?.Name ?? "";
+                if (funcName is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                {
+                    Console.WriteLine($"LLM вернул инструмент: {funcName}");
+                    return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                }
 
+                Console.WriteLine($"LLM вернул инструмент: {funcName}");
+            }
+        }
+
+        // Try XML/backtick-style tool call blocks in response (qwen3.6 format)
+        if (!string.IsNullOrEmpty(content))
+        {
+            var xmlToolCalls = ExtractXmlToolCallsForReview(content);
+
+            if (xmlToolCalls != null && xmlToolCalls.Count > 0)
+            {
+                foreach (var call in xmlToolCalls)
+                {
+                    var toolName = call["name"]?.ToString() ?? "";
+                    if (toolName is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                    {
+                        Console.WriteLine($"Найден XML инструмент: {toolName}");
+                        return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                    }
+
+                    Console.WriteLine($"LLM вернул XML инструмент: {toolName}");
+                }
+            }
+
+            // Fallback: try parsing entire response as JSON tool call (no wrapping)
+            var trimmed = content.Trim();
+            if (trimmed.StartsWith('{'))
+            {
                 try
                 {
-                    using var doc = JsonDocument.Parse(rawJson);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("name", out var nameProp) && root.TryGetProperty("arguments", out var argsProp))
+                    using var doc = JsonDocument.Parse(trimmed);
+                    if (doc.RootElement.TryGetProperty("name", out var nameProp) && doc.RootElement.TryGetProperty("arguments", out var argsProp))
                     {
                         if (nameProp.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
                         {
-                            // LLM returned a tool call — signal to caller that it should execute via MCP
+                            Console.WriteLine("Найден JSON инструмент (без обёртки).");
                             return null; // signals: "execute get_merge_request_diffs via MCP manager"
                         }
+
+                        Console.WriteLine($"Найден JSON инструмент: {nameProp.GetString()}");
                     }
                 }
-                catch (JsonException) { /* skip invalid JSON */ }
-            }
+                catch (JsonException) { /* not valid JSON */ }
 
-            if (matches.Count > 0) break;
+                // Also try Python-style: [name:"...",arguments:{...}] without wrapping
+                if (trimmed.StartsWith('['))
+                {
+                    try
+                    {
+                        var jsonStr = NormalizePythonStyleToJson(trimmed);
+                        using var doc = JsonDocument.Parse(jsonStr);
+                        if (doc.RootElement.TryGetProperty("name", out var nameProp2) && doc.RootElement.TryGetProperty("arguments", out var argsProp2))
+                        {
+                            if (nameProp2.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                            {
+                                Console.WriteLine("Найден Python-style инструмент (без обёртки).");
+                                return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                            }
+
+                            Console.WriteLine($"Найден Python-style инструмент: {nameProp2.GetString()}");
+                        }
+                    }
+                    catch (JsonException) { /* not valid Python-style object, ignore */ }
+                }
+            }
         }
 
-        // Fallback: try parsing entire response as JSON tool call (no wrapping)
-        var trimmed = content.Trim();
+        // If we got content but no tool call, add it back for retry (LLM may need to try again)
+        if (!string.IsNullOrEmpty(content))
+        {
+            messages.Add(new Dictionary<string, object>
+            {
+                ["role"] = "assistant",
+                ["content"] = content,
+            });
+        }
+    }
+
+    throw new InvalidOperationException("LLM did not return a tool call for get_merge_request_diffs after retries.");
+}
+
+static List<Dictionary<string, object>>? ExtractXmlToolCallsForReview(string response)
+{
+    var results = new List<Dictionary<string, object>>();
+
+    var patterns = new[]
+    {
+        new Regex(@"<tool_call>\n?(?<json>[\s\S]*?)\n?</tool_call>", RegexOptions.Compiled, TimeSpan.FromSeconds(5))
+    };
+
+    foreach (var pattern in patterns)
+    {
+        var matches = pattern.Matches(response);
+        foreach (Match match in matches)
+        {
+            var rawJson = match.Groups["json"].Value.Trim();
+
+            string jsonStr;
+            try
+            {
+                using var _ = JsonDocument.Parse(rawJson);
+                jsonStr = rawJson;
+            }
+            catch (JsonException)
+            {
+                jsonStr = NormalizePythonStyleToJson(rawJson);
+
+                try
+                {
+                    using var _ = JsonDocument.Parse(jsonStr);
+                }
+                    catch (JsonException)
+                    {
+                        string repaired = rawJson.TrimEnd();
+                        bool fixed_ = false;
+                        while (repaired.Length > 1 && repaired.EndsWith('}'))
+                        {
+                            repaired = repaired[..^1].TrimEnd();
+                            try
+                            {
+                                using var __ = JsonDocument.Parse(repaired);
+                                jsonStr = repaired;
+                                fixed_ = true;
+                                break;
+                            }
+                            catch (JsonException) { }
+                        }
+
+                        if (!fixed_)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine($"Ошибка парсинга tool call блока: {rawJson}");
+                            Console.ResetColor();
+                            continue;
+                        }
+                    }
+            }
+
+            using var doc = JsonDocument.Parse(jsonStr);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("name", out var nameProp))
+            {
+                var callObj = new Dictionary<string, object>
+                {
+                    ["name"] = nameProp.GetString() ?? "",
+                };
+
+                if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
+                {
+                    callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp);
+                }
+
+                results.Add(callObj);
+            }
+        }
+
+        if (results.Count > 0) break;
+    }
+
+    // Fallback: try parsing the entire response as a JSON tool call (no XML/backtick wrapping)
+    if (results.Count == 0)
+    {
+        string trimmed = response.Trim();
         if (trimmed.StartsWith('{'))
         {
             try
@@ -744,104 +906,343 @@ static async Task<string?> InvokeReviewToolCallViaLlmAsync(
                 using var doc = JsonDocument.Parse(trimmed);
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("name", out var nameProp2) && root.TryGetProperty("arguments", out var argsProp2))
+                if (root.TryGetProperty("name", out var nameProp) && root.TryGetProperty("function", out var funcProp))
                 {
-                    if (nameProp2.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                    var callObj = new Dictionary<string, object>
                     {
-                        // LLM returned a tool call — signal to caller that it should execute via MCP
-                        return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                        ["name"] = nameProp.GetString() ?? "",
+                        ["function"] = funcProp.GetString() ?? ""
+                    };
+
+                    if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
+                    {
+                        callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp);
                     }
+
+                    results.Add(callObj);
                 }
             }
-            catch (JsonException) { /* not valid JSON */ }
+            catch (JsonException) { /* not a valid JSON object, ignore */ }
+        }
 
-            // Also try Python-style: [name:"...",arguments:{...}] without wrapping
-            if (trimmed.StartsWith('['))
+        // Also try Python-style: [name:"...",function:"..."] without wrapping
+        if (results.Count == 0 && trimmed.StartsWith('['))
+        {
+            try
+            {
+                string jsonStr = NormalizePythonStyleToJson(trimmed);
+                using var doc = JsonDocument.Parse(jsonStr);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("name", out var nameProp2) && root.TryGetProperty("function", out var funcProp2))
+                {
+                    var callObj = new Dictionary<string, object>
+                    {
+                        ["name"] = nameProp2.GetString() ?? "",
+                        ["function"] = funcProp2.GetString() ?? ""
+                    };
+
+                    if (root.TryGetProperty("arguments", out var argsProp2) && argsProp2.ValueKind == JsonValueKind.Object)
+                    {
+                        callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp2);
+                    }
+
+                    results.Add(callObj);
+                }
+            }
+            catch (JsonException) { /* not a valid Python-style object, ignore */ }
+        }
+    }
+
+    return results.Count > 0 ? results : null;
+}
+
+static async Task<bool> PostReviewCommentViaMcpAsync(
+    string llmApiUrl, string llmModel, string? llmApiKey,
+    McpServerManager mcpManager, 
+    string projectId, string mergeRequestIid,
+    string reviewComment)
+{
+    using var httpClient = new HttpClient
+    {
+        BaseAddress = new Uri(llmApiUrl),
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+
+    if (!string.IsNullOrEmpty(llmApiKey))
+        httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", llmApiKey);
+
+    var safeComment = reviewComment.Length > 10000 ? reviewComment[..10000] + "...(truncated)" : reviewComment;
+    var systemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools("", mcpManager.Tools ?? []);
+
+    var userMessage = $"Please publish the following code review comment as a merge request note by calling 'create_merge_request_note' with project_id='{projectId}', merge_request_iid='{mergeRequestIid}', and body containing the review text below.\n\n{safeComment}";
+
+    var messages = new List<Dictionary<string, object>>();
+    messages.Add(new Dictionary<string, object> { ["role"] = "system", ["content"] = systemPrompt });
+    messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessage });
+
+    const int maxRetries = 3;
+    
+    for (int attempt = 1; attempt <= maxRetries; attempt++)
+    {
+        var request = new Dictionary<string, object>
+        {
+            ["model"] = llmModel,
+            ["messages"] = messages,
+        };
+
+        request["max_tokens"] = 50000;
+        request["stream"] = false;
+        request["temperature"] = 0.2;
+
+        var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request);
+        response.EnsureSuccessStatusCode();
+
+        var result = await response.Content.ReadFromJsonAsync<QwenChatResponse>();
+        var choice = result?.Choices?.FirstOrDefault();
+
+        if (choice == null) continue;
+
+        var assistantMsg = choice.Message;
+        string? content = assistantMsg?.Content;
+        List<QwenToolCall>? toolCalls = assistantMsg?.ToolCalls ?? [];
+
+        // Try native OpenAI-style tool_calls
+        if (toolCalls != null && toolCalls.Count > 0)
+        {
+            foreach (var tc in toolCalls)
+            {
+                var funcName = tc.Function?.Name ?? "";
+                if (funcName is "create_merge_request_note" or "createMergeRequestNote")
+                {
+                    Console.WriteLine($"LLM вернул инструмент: {funcName}");
+
+                    Dictionary<string, object> args;
+                    try
+                    {
+                        args = McpToolMapper.ParseToolCallArguments(tc.Function.Arguments ?? "{}");
+                    }
+                    catch (JsonException)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("Ошибка парсинга аргументов.");
+                        Console.ResetColor();
+                        return false;
+                    }
+
+                    if (!args.ContainsKey("project_id")) args["project_id"] = projectId;
+                    if (!args.ContainsKey("merge_request_iid")) args["merge_request_iid"] = mergeRequestIid;
+
+                    if (!args.ContainsKey("body"))
+                    {
+                        args["body"] = safeComment;
+                    }
+
+                    return await ExecuteCreateMergeRequestNoteAsync(mcpManager, projectId, mergeRequestIid, args);
+                }
+
+                Console.WriteLine($"LLM вернул инструмент: {funcName}");
+            }
+        }
+
+        // Try XML/backtick-style tool call blocks in response (qwen3.6 format)
+        if (!string.IsNullOrEmpty(content))
+        {
+            var xmlToolCalls = ExtractXmlToolCallsForReview(content);
+
+            if (xmlToolCalls != null && xmlToolCalls.Count > 0)
+            {
+                foreach (var call in xmlToolCalls)
+                {
+                    var toolName = call["name"]?.ToString() ?? "";
+                    if (toolName is "create_merge_request_note" or "createMergeRequestNote")
+                    {
+                        Console.WriteLine($"Найден XML инструмент: {toolName}");
+
+                        Dictionary<string, object> args;
+                        try
+                        {
+                            if (call.ContainsKey("arguments"))
+                                args = McpToolMapper.ParseToolCallArguments(JsonSerializer.Serialize(call["arguments"]));
+                            else
+                                args = new Dictionary<string, object>();
+                        }
+                        catch (JsonException)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine("Ошибка парсинга аргументов.");
+                            Console.ResetColor();
+                            return false;
+                        }
+
+                        if (!args.ContainsKey("project_id")) args["project_id"] = projectId;
+                        if (!args.ContainsKey("merge_request_iid")) args["merge_request_iid"] = mergeRequestIid;
+
+                        if (!args.ContainsKey("body"))
+                        {
+                            args["body"] = safeComment;
+                        }
+
+                        return await ExecuteCreateMergeRequestNoteAsync(mcpManager, projectId, mergeRequestIid, args);
+                    }
+
+                    Console.WriteLine($"LLM вернул XML инструмент: {toolName}");
+                }
+            }
+
+            // Fallback: try parsing entire response as JSON tool call (no wrapping)
+            var trimmed = content.Trim();
+            if (trimmed.StartsWith('{'))
             {
                 try
                 {
-                    var jsonStr = NormalizePythonStyleToJson(trimmed);
-                    using var doc = JsonDocument.Parse(jsonStr);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("name", out var nameProp3) && root.TryGetProperty("arguments", out var argsProp3))
+                    using var doc = JsonDocument.Parse(trimmed);
+                    if (doc.RootElement.TryGetProperty("name", out var nameProp) && doc.RootElement.TryGetProperty("arguments", out var argsProp))
                     {
-                        if (nameProp3.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                        if (nameProp.GetString() is "create_merge_request_note" or "createMergeRequestNote")
                         {
-                            return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                            Console.WriteLine("Найден JSON инструмент (без обёртки).");
+
+                            Dictionary<string, object> args;
+                            try
+                            {
+                                using var doc2 = JsonDocument.Parse(argsProp.GetRawText());
+                                args = McpToolMapper.ParseJsonElement(doc2.RootElement);
+                            }
+                            catch (JsonException)
+                            {
+                                var normalized = NormalizePythonStyleToJson(argsProp.GetRawText());
+                                try
+                                {
+                                    using var doc2 = JsonDocument.Parse(normalized);
+                                    args = McpToolMapper.ParseJsonElement(doc2.RootElement);
+                                }
+                                catch (JsonException)
+                                {
+                                    Console.ForegroundColor = ConsoleColor.Red;
+                                    Console.WriteLine("Ошибка парсинга аргументов.");
+                                    Console.ResetColor();
+                                    return false;
+                                }
+                            }
+
+                            if (!args.ContainsKey("project_id")) args["project_id"] = projectId;
+                            if (!args.ContainsKey("merge_request_iid")) args["merge_request_iid"] = mergeRequestIid;
+
+                            if (!args.ContainsKey("body"))
+                            {
+                                args["body"] = safeComment;
+                            }
+
+                            return await ExecuteCreateMergeRequestNoteAsync(mcpManager, projectId, mergeRequestIid, args);
                         }
+
+                        Console.WriteLine($"Найден JSON инструмент: {nameProp.GetString()}");
                     }
                 }
-                catch (JsonException) { /* not valid Python-style object, ignore */ }
+                catch (JsonException) { /* not valid JSON */ }
+
+                // Also try Python-style: [name:"...",arguments:{...}] without wrapping
+                if (trimmed.StartsWith('['))
+                {
+                    try
+                    {
+                        var jsonStr = NormalizePythonStyleToJson(trimmed);
+                        using var doc2 = JsonDocument.Parse(jsonStr);
+                        if (doc2.RootElement.TryGetProperty("name", out var nameProp2) && doc2.RootElement.TryGetProperty("arguments", out var argsProp2))
+                        {
+                            if (nameProp2.GetString() is "create_merge_request_note" or "createMergeRequestNote")
+                            {
+                                Console.WriteLine("Найден Python-style инструмент (без обёртки).");
+
+                                Dictionary<string, object> args;
+                                try
+                                {
+                                    using var doc3 = JsonDocument.Parse(argsProp2.GetRawText());
+                                    args = McpToolMapper.ParseJsonElement(doc3.RootElement);
+                                }
+                                catch (JsonException)
+                                {
+                                    var normalized = NormalizePythonStyleToJson(argsProp2.GetRawText());
+                                    try
+                                    {
+                                        using var doc3 = JsonDocument.Parse(normalized);
+                                        args = McpToolMapper.ParseJsonElement(doc3.RootElement);
+                                    }
+                                    catch (JsonException)
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Red;
+                                        Console.WriteLine("Ошибка парсинга аргументов.");
+                                        Console.ResetColor();
+                                        return false;
+                                    }
+                                }
+
+                                if (!args.ContainsKey("project_id")) args["project_id"] = projectId;
+                                if (!args.ContainsKey("merge_request_iid")) args["merge_request_iid"] = mergeRequestIid;
+
+                                if (!args.ContainsKey("body"))
+                                {
+                                    args["body"] = safeComment;
+                                }
+
+                                return await ExecuteCreateMergeRequestNoteAsync(mcpManager, projectId, mergeRequestIid, args);
+                            }
+
+                            Console.WriteLine($"Найден Python-style инструмент: {nameProp2.GetString()}");
+                        }
+                    }
+                    catch (JsonException) { /* not valid Python-style object, ignore */ }
+                }
+            }
+
+            // If we got content but no tool call, add it back for retry (LLM may need to try again)
+            if (!string.IsNullOrEmpty(content))
+            {
+                messages.Add(new Dictionary<string, object>
+                {
+                    ["role"] = "assistant",
+                    ["content"] = content,
+                });
+                messages.Add(new Dictionary<string, object>
+                {
+                    ["role"] = "user",
+                    ["content"] = "You must call the tool to publish the review. Do not output text — use the tool only.",
+                });
             }
         }
     }
 
-    throw new InvalidOperationException("LLM did not return a tool call for get_merge_request_diffs. Response: " + (content ?? "(empty)"));
+    return false;
 }
 
-static async Task<string> CallGetMergeRequestDiffViaMcpAsync(McpServerManager mcpManager, string projectId, string mergeRequestIid)
+static async Task<bool> ExecuteCreateMergeRequestNoteAsync(McpServerManager mcpManager, string projectId, string mergeRequestIid, Dictionary<string, object> args)
 {
-    var args = new Dictionary<string, object>
+    try
     {
-        ["project_id"] = projectId,
-        ["merge_request_iid"] = mergeRequestIid
-    };
+        var callResult = await mcpManager.CallToolAsync("create_merge_request_note", args);
+        var formatted = McpToolMapper.FormatToolResult(callResult);
 
-    Console.WriteLine("Вызов инструмента get_merge_request_diffs...");
-
-    var result = await mcpManager.CallToolAsync("get_merge_request_diffs", args);
-
-    var formatted = McpToolMapper.FormatToolResult(result);
-    Console.WriteLine($"Результат: {formatted.Length} символов");
-
-    return formatted;
-}
-
-static string CleanReviewResponse(string rawAnswer)
-{
-    if (string.IsNullOrEmpty(rawAnswer)) return rawAnswer;
-
-    var text = rawAnswer.Trim();
-
-    // Remove JSON wrappers with recognized keys
-    if (text.StartsWith('{') && text.EndsWith('}'))
-    {
-        try
+        if (callResult.IsError == true)
         {
-            using var doc = JsonDocument.Parse(text);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("answer", out var answerProp))
-                return answerProp.GetString()?.Trim() ?? text;
-
-            if (root.TryGetProperty("comment", out var commentProp))
-                return commentProp.GetString()?.Trim() ?? text;
-
-            if (root.TryGetProperty("review", out var reviewProp))
-                return reviewProp.GetString()?.Trim() ?? text;
-
-            if (root.TryGetProperty("content", out var contentProp))
-                return contentProp.GetString()?.Trim() ?? text;
-
-            // If it's a simple JSON object with no recognized keys, return as-is
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Ошибка GitLab: {formatted}");
+            Console.ResetColor();
+            return false;
         }
-        catch { /* not valid JSON */ }
+
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"Комментарий успешно опубликован. Результат: {formatted}");
+        Console.ResetColor();
+        return true;
     }
-
-    // Remove markdown code block wrappers (```language ... ```)
-    var firstNewline = text.IndexOf('\n');
-    if (firstNewline > 0 && text.StartsWith("```"))
-        text = text[(firstNewline + 1)..];
-
-    var lastBackticks = text.LastIndexOf("```");
-    if (lastBackticks > 0 && lastBackticks < text.Length - 1)
-        text = text[..lastBackticks];
-
-    // Remove citation wrappers like [CITATION:0]...[/CITATION]
-    text = Regex.Replace(text, @"\[CITATION:\d+\].*?\[/CITATION\]", "", RegexOptions.Compiled);
-
-    return text.Trim();
+    catch (Exception ex)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"Ошибка вызова инструмента: {ex.Message}");
+        Console.ResetColor();
+        return false;
+    }
 }
 
 static string NormalizePythonStyleToJson(string pythonStyle)
@@ -1001,6 +1402,70 @@ static string NormalizePythonStyleToJson(string pythonStyle)
 
     string finalText = isList ? result.ToString() + '}' : result.ToString();
     return finalText;
+}
+
+static async Task<string?> CallGetMergeRequestDiffViaMcpAsync(McpServerManager mcpManager, string projectId, string mergeRequestIid)
+{
+    var args = new Dictionary<string, object>
+    {
+        ["project_id"] = projectId,
+        ["merge_request_iid"] = mergeRequestIid
+    };
+
+    Console.WriteLine("Вызов инструмента get_merge_request_diffs...");
+
+    var result = await mcpManager.CallToolAsync("get_merge_request_diffs", args);
+
+    var formatted = McpToolMapper.FormatToolResult(result);
+    Console.WriteLine($"Результат: {formatted.Length} символов");
+
+    return formatted;
+}
+
+static string CleanReviewResponse(string rawAnswer)
+{
+    if (string.IsNullOrEmpty(rawAnswer)) return rawAnswer;
+
+    var text = rawAnswer.Trim();
+
+    // Remove JSON wrappers with recognized keys
+    if (text.StartsWith('{') && text.EndsWith('}'))
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("answer", out var answerProp))
+                return answerProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("comment", out var commentProp))
+                return commentProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("review", out var reviewProp))
+                return reviewProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("content", out var contentProp))
+                return contentProp.GetString()?.Trim() ?? text;
+
+            // If it's a simple JSON object with no recognized keys, return as-is
+        }
+        catch { /* not valid JSON */ }
+    }
+
+    // Remove markdown code block wrappers (```language ... ```)
+    var firstNewline = text.IndexOf('\n');
+    if (firstNewline > 0 && text.StartsWith("```"))
+        text = text[(firstNewline + 1)..];
+
+    var lastBackticks = text.LastIndexOf("```");
+    if (lastBackticks > 0 && lastBackticks < text.Length - 1)
+        text = text[..lastBackticks];
+
+    // Remove citation wrappers like [CITATION:0]...[/CITATION]
+    text = Regex.Replace(text, @"\[CITATION:\d+\].*?\[/CITATION\]", "", RegexOptions.Compiled);
+
+    return text.Trim();
 }
 
 static string NormalizeGitUrl(string url, string? token)

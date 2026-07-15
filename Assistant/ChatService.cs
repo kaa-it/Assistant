@@ -772,10 +772,28 @@ public class ChatService
                     }
                     catch (JsonException)
                     {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"Ошибка парсинга tool call блока: {rawJson}");
-                        Console.ResetColor();
-                        continue;
+                        string repaired = rawJson.TrimEnd();
+                        bool fixed_ = false;
+                        while (repaired.Length > 1 && repaired.EndsWith('}'))
+                        {
+                            repaired = repaired[..^1].TrimEnd();
+                            try
+                            {
+                                using var __ = JsonDocument.Parse(repaired);
+                                jsonStr = repaired;
+                                fixed_ = true;
+                                break;
+                            }
+                            catch (JsonException) { }
+                        }
+
+                        if (!fixed_)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine($"Ошибка парсинга tool call блока: {rawJson}");
+                            Console.ResetColor();
+                            continue;
+                        }
                     }
                 }
 
