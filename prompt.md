@@ -103,10 +103,6 @@ Please provide a code review comment covering:
 - Вывести ответ LLM (очищенный от JSON/citation обёрток, если есть)
 - Вывести источники из RAG (если использовались)
 
-### 7. Обновление `prompt.md` (опционально)
-
-Удалить или обновить файл `D:\RiderProjects\Assistant\prompt.md`, так как задача будет реализована.
-
 ---
 
 ### Сводная таблица файлов для изменения:
@@ -117,7 +113,6 @@ Please provide a code review comment covering:
 | `Assistant/ChatService.cs` | Без изменений (использует существующие методы tool-calling) |
 | `Assistant/McpServerManager.cs` | Без изменений (использует существующий `ConnectAsync`, `CallToolAsync`) |
 | `Assistant/ToolPromptBuilder.cs` | Без изменений (использует существующий `BuildSystemPromptWithTools`) |
-| `prompt.md` | Удалить/обновить (задача реализована) |
 
 ### Зависимости между компонентами:
 - `RunReviewAsync` использует существующие: `SqliteVectorStore`, `OpenAiCompatibleEmbeddingService`, `OpenAiCompatibleLlmService`, `McpServerManager`, `EnhancedRagPipeline`, `ToolPromptBuilder`

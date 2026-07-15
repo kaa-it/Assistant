@@ -2,16 +2,24 @@
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 const string Usage = """
-Assistant <repository-url> [target-directory] [--chat]
+Assistant <repository-url> [target-directory] [--chat | --review --project-id <id> --merge-request-iid <iid>]
 
 Clones a Git repository at startup, then indexes the cloned content.
 With --chat flag: starts interactive RAG chat with a local LLM after indexing.
+With --review flag: performs an automated code review of a GitLab merge request (one-shot, no chat).
 
 Arguments:
   repository-url    URL of the Git repository (required)
   target-directory  Optional output directory (default: ./cloned-repo)
+
+Flags:
+  --chat                    Start interactive RAG chat mode after indexing
+  --review                  Enable automated code review mode (one-shot)
+  --project-id <value>      GitLab project ID (required with --review)
+  --merge-request-iid <val> Merge request IID (required with --review)
 
 Environment variables:
   GIT_PERSONAL_ACCESS_TOKEN    Personal Access Token for HTTPS URLs (optional, required when using https://)
@@ -29,6 +37,7 @@ Examples:
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat LLM_API_URL=http://localhost:11434
+  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --review --project-id 42 --merge-request-iid 123
 """;
 
 if (args.Length == 0)
@@ -41,6 +50,9 @@ if (args.Length == 0)
 var repoUrl = args[0];
 string targetDir = "./cloned-repo";
 bool runChat = false;
+bool runReview = false;
+string? projectId = null;
+string? mergeRequestIid = null;
 
 for (int i = 1; i < args.Length; i++)
 {
@@ -49,12 +61,47 @@ for (int i = 1; i < args.Length; i++)
     {
         runChat = true;
     }
+    else if (arg.Equals("--review", StringComparison.OrdinalIgnoreCase))
+    {
+        runReview = true;
+    }
+    else if (arg.Equals("--project-id", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+    {
+        projectId = args[++i];
+    }
+    else if (arg.Equals("--merge-request-iid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+    {
+        mergeRequestIid = args[++i];
+    }
     else if (!targetDir.Equals("./cloned-repo", StringComparison.Ordinal) || i > 1)
     {
         // First non-flag arg is target directory
         if (targetDir.Equals("./cloned-repo", StringComparison.Ordinal))
             targetDir = arg;
     }
+}
+
+// Validate --review mode arguments
+if (runReview)
+{
+    if (string.IsNullOrWhiteSpace(projectId))
+    {
+        Console.Error.WriteLine("Error: --project-id is required when using --review.");
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    if (string.IsNullOrWhiteSpace(mergeRequestIid))
+    {
+        Console.Error.WriteLine("Error: --merge-request-iid is required when using --review.");
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    // In review mode, skip cloning and go straight to review
+    var reviewTargetDir = Path.GetFullPath(targetDir);
+    await RunReviewAsync(targetDir, reviewTargetDir, projectId!, mergeRequestIid!);
+    return;
 }
 
 var isHttps = repoUrl.StartsWith("https://", StringComparison.Ordinal);
@@ -314,6 +361,648 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
     }
 }
 
+static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, string projectId, string mergeRequestIid)
+{
+    Console.WriteLine($"\n=== CODE REVIEW MODE ===");
+    Console.WriteLine($"Project ID: {projectId}");
+    Console.WriteLine($"Merge Request IID: {mergeRequestIid}\n");
+
+    // Step 1: Check if index exists
+    var dbPath = Path.Combine(Path.GetFullPath(targetDir), "document_index.db");
+
+    // Step 2: Check LLM API availability
+    var llmApiUrl = Environment.GetEnvironmentVariable("LLM_API_URL") ?? "http://192.168.1.15:1234";
+    var llmModel = Environment.GetEnvironmentVariable("LLM_MODEL") ?? "qwen/qwen3.6-35b-a3b";
+    var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
+
+    Console.WriteLine($"Проверка LLM API ({llmApiUrl})...");
+    ILlmService llm;
+    try 
+    {
+        llm = new OpenAiCompatibleLlmService(llmApiUrl, llmModel, llmApiKey, 4096);
+        var testPrompt = "Respond with exactly: OK";
+        await llm.AskAsync(testPrompt, "You are a test assistant. Respond with exactly 'OK' and nothing else.", 10);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("✅ LLM API доступен\n");
+        Console.ResetColor();
+    }
+    catch (Exception ex) 
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"❌ LLM API недоступен: {ex.Message}");
+        Console.ResetColor();
+        Console.WriteLine("Убедитесь, что LLM API запущен на {0}", llmApiUrl);
+        return;
+    }
+
+    // Step 3: Connect MCP servers (GitLab is required for get_merge_request_diffs)
+    McpServerManager? mcpManager = null;
+    try
+    {
+        Console.WriteLine("\nПодключение к MCP серверам...");
+        mcpManager = new McpServerManager();
+
+        // GitLab MCP server (required for review)
+        var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
+        var gitlabApiUrl  = Environment.GetEnvironmentVariable("GITLAB_API_URL");
+
+        if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+        {
+            mcpManager.AddServer("zereight-mcp-gitlab", "zereight-mcp-gitlab",
+                new[] { "--token=" + gitlabToken, "--api-url=" + gitlabApiUrl });
+        }
+
+        await mcpManager.ConnectAsync();
+    }
+    catch (Exception ex) 
+    {
+        Console.WriteLine($"Предупреждение: не удалось подключить MCP серверы: {ex.Message}");
+        Console.WriteLine("Рецензирование будет выполнено без доступа к GitLab API.\n");
+    }
+
+    // Step 4: Get merge request diff via MCP (with LLM tool-calling as fallback)
+    string? diffContent = null;
+
+    if (mcpManager != null && mcpManager.IsConnected)
+    {
+        try
+        {
+            Console.WriteLine("Получение diff мердж-реквеста...");
+
+            // Try LLM tool-calling first (LLM decides to call the tool)
+            var llmResult = await InvokeReviewToolCallViaLlmAsync(
+                llmApiUrl, llmModel, llmApiKey, projectId, mergeRequestIid);
+
+            // If LLM returned a tool call (null result), execute via MCP directly
+            if (llmResult == null)
+            {
+                diffContent = await CallGetMergeRequestDiffViaMcpAsync(mcpManager, projectId, mergeRequestIid);
+                Console.WriteLine($"Получен diff мердж-реквеста: {diffContent.Length} символов\n");
+            }
+
+            // If LLM didn't provide a tool call, try direct MCP call as fallback
+            if (string.IsNullOrEmpty(diffContent))
+            {
+                diffContent = await CallGetMergeRequestDiffViaMcpAsync(mcpManager, projectId, mergeRequestIid);
+                Console.WriteLine($"Получен diff мердж-реквеста: {diffContent.Length} символов\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Предупреждение: не удалось получить diff через MCP: {ex.Message}");
+            Console.WriteLine("Рецензирование будет выполнено без diff.\n");
+        }
+    }
+
+    // Fallback: try direct MCP call even if LLM tool-calling failed
+    if (string.IsNullOrEmpty(diffContent) && mcpManager != null && mcpManager.IsConnected)
+    {
+        try
+        {
+            diffContent = await CallGetMergeRequestDiffViaMcpAsync(mcpManager, projectId, mergeRequestIid);
+            Console.WriteLine($"Получен diff мердж-реквеста: {diffContent.Length} символов\n");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Предупреждение: не удалось получить diff через MCP: {ex.Message}");
+            Console.WriteLine("Рецензирование будет выполнено без diff.\n");
+        }
+    }
+
+    // If MCP is not connected, try direct HTTP call to GitLab API as last resort
+    if (string.IsNullOrEmpty(diffContent))
+    {
+        var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
+        var gitlabApiUrl  = Environment.GetEnvironmentVariable("GITLAB_API_URL");
+
+        if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+        {
+            try
+            {
+                Console.WriteLine("Попытка прямого вызова GitLab API...");
+
+                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(120) };
+                httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", gitlabToken);
+                httpClient.DefaultRequestHeaders.Add("PRIVATE-TOKEN", gitlabToken);
+
+                var uri = $"/projects/{Uri.EscapeDataString(projectId)}/merge_requests/{Uri.EscapeDataString(mergeRequestIid)}/diffs";
+                var response = await httpClient.GetAsync(uri);
+                response.EnsureSuccessStatusCode();
+
+                diffContent = await response.Content.ReadAsStringAsync();
+                Console.WriteLine($"Получен diff через GitLab API: {diffContent.Length} символов\n");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Предупреждение: не удалось получить diff через GitLab API: {ex.Message}");
+                Console.WriteLine("Рецензирование будет выполнено без diff.\n");
+            }
+        }
+    }
+
+    // Fallback: try direct MCP call even if LLM tool-calling failed
+    if (string.IsNullOrEmpty(diffContent) && mcpManager != null && mcpManager.IsConnected)
+    {
+        try
+        {
+            diffContent = await CallGetMergeRequestDiffViaMcpAsync(mcpManager, projectId, mergeRequestIid);
+            Console.WriteLine($"Получен diff мердж-реквеста: {diffContent.Length} символов\n");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Предупреждение: не удалось получить diff через MCP: {ex.Message}");
+            Console.WriteLine("Рецензирование будет выполнено без diff.\n");
+        }
+    }
+
+    // If MCP is not connected, try direct HTTP call to GitLab API as last resort
+    if (string.IsNullOrEmpty(diffContent))
+    {
+        var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
+        var gitlabApiUrl  = Environment.GetEnvironmentVariable("GITLAB_API_URL");
+
+        if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+        {
+            try
+            {
+                Console.WriteLine("Попытка прямого вызова GitLab API...");
+
+                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(120) };
+                httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", gitlabToken);
+                httpClient.DefaultRequestHeaders.Add("PRIVATE-TOKEN", gitlabToken);
+
+                var uri = $"/projects/{Uri.EscapeDataString(projectId)}/merge_requests/{Uri.EscapeDataString(mergeRequestIid)}/diffs";
+                var response = await httpClient.GetAsync(uri);
+                response.EnsureSuccessStatusCode();
+
+                diffContent = await response.Content.ReadAsStringAsync();
+                Console.WriteLine($"Получен diff через GitLab API: {diffContent.Length} символов\n");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Предупреждение: не удалось получить diff через GitLab API: {ex.Message}");
+                Console.WriteLine("Рецензирование будет выполнено без diff.\n");
+            }
+        }
+    }
+
+    // Step 5: RAG context retrieval (if index exists)
+    List<string> ragChunks = [];
+
+    if (File.Exists(dbPath))
+    {
+        try
+        {
+            Console.WriteLine("RAG-поиск контекста проекта...");
+
+            var embeddingApiUrl = Environment.GetEnvironmentVariable("EMBEDDING_API_URL") ?? "http://192.168.1.15:1234";
+            var embeddingModel = Environment.GetEnvironmentVariable("EMBEDDING_MODEL") ?? "text-embedding-nomic-embed-text-v1.5";
+            var embeddingService = new OpenAiCompatibleEmbeddingService(embeddingApiUrl, embeddingModel);
+
+            var rewrite = new HeuristicQueryRewriteService();
+            var ragPipeline = new EnhancedRagPipeline(embeddingService, new SqliteVectorStore(dbPath), rewrite);
+
+            var ragResult = await ragPipeline.ExecuteAsync(
+                "code review best practices, architecture patterns, common bugs in this project", 
+                RagPipelineMode.FullPipeline);
+
+            foreach (var chunk in ragResult.Chunks.Take(5))
+            {
+                var content = chunk.Chunk.Content;
+                if (!string.IsNullOrWhiteSpace(content))
+                    ragChunks.Add($"[{chunk.Chunk.Source}] {content}");
+            }
+
+            embeddingService.Dispose();
+
+            if (ragChunks.Count > 0)
+                Console.WriteLine($"RAG: найдено {ragChunks.Count} релевантных чанков\n");
+            else
+                Console.WriteLine("RAG: контекст не найден в индексе.\n");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Предупреждение: RAG-поиск не выполнен: {ex.Message}\n");
+        }
+    }
+    else
+    {
+        Console.WriteLine("Индекс не найден. RAG-контекст будет пропущен.\n");
+    }
+
+    // Step 6: Build final review prompt and get LLM answer
+    Console.WriteLine("Формирование финального промпта для ревью...\n");
+
+    var diffSection = !string.IsNullOrEmpty(diffContent)
+        ? $"=== MERGE REQUEST DIFF ===\n{diffContent}\n"
+        : "=== MERGE REQUEST DIFF ===\n(diff not available — MCP server was not connected)\n";
+
+    var ragSection = ragChunks.Count > 0
+        ? $"=== PROJECT CONTEXT (from RAG) ===\n{string.Join("\n\n---\n", ragChunks)}\n"
+        : "";
+
+    var finalUserPrompt = $"{diffSection}\n{ragSection}Please provide a code review comment covering:\n1. Potential bugs and edge cases\n2. Architecture concerns\n3. Recommendations for improvement";
+
+    var systemPrompt = "You are an expert code reviewer analyzing a GitLab merge request. Analyze the provided diff and project context to identify potential bugs, architecture issues, security concerns, performance problems, and provide actionable recommendations. If the diff is not available, note that in your review.";
+
+    Console.WriteLine("=== CODE REVIEW: MR #" + mergeRequestIid + " ===\n");
+
+    try
+    {
+        var reviewAnswer = await llm.AskAsync(finalUserPrompt, systemPrompt, 20000);
+        var cleaned = CleanReviewResponse(reviewAnswer);
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("=== CODE REVIEW: MR #" + mergeRequestIid + " ===");
+        Console.ResetColor();
+
+        Console.WriteLine($"\n{cleaned}");
+
+        if (ragChunks.Count > 0)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("\n--- RAG Sources used ---");
+            foreach (var chunk in ragChunks.Take(3))
+            {
+                var source = chunk.Split(']').Length > 1 ? chunk.Substring(0, chunk.IndexOf(']') + 1) : "unknown";
+                Console.WriteLine($"  {source}");
+            }
+            Console.ResetColor();
+        }
+
+        if (!string.IsNullOrEmpty(diffContent))
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("\n--- Diff source: GitLab MCP (get_merge_request_diffs) ---");
+            Console.ResetColor();
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"Ошибка ревью: {ex.Message}");
+        Console.ResetColor();
+    }
+
+    llm.Dispose();
+
+    if (mcpManager != null)
+        await mcpManager.DisposeAsync();
+}
+
+static async Task<string?> InvokeReviewToolCallViaLlmAsync(
+    string llmApiUrl, string llmModel, string? llmApiKey, 
+    string projectId, string mergeRequestIid)
+{
+    using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
+
+    if (!string.IsNullOrEmpty(llmApiKey))
+        httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", llmApiKey);
+
+    var systemPrompt = "You are a code review assistant. You have access to MCP tools via the chat template. When asked to get merge request diffs, call the tool 'get_merge_request_diffs' with parameters project_id and merge_request_iid. Return only the tool call, not a text answer.";
+
+    var userMessage = $"Please get the merge request diffs for project_id='{projectId}' and merge_request_iid='{mergeRequestIid}'. Call the tool 'get_merge_request_diffs' with these parameters.";
+
+    var messages = new List<Dictionary<string, object>>();
+    messages.Add(new Dictionary<string, object> { ["role"] = "system", ["content"] = systemPrompt });
+    messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessage });
+
+    var request = new Dictionary<string, object>
+    {
+        ["model"] = llmModel,
+        ["messages"] = messages,
+    };
+
+    request["max_tokens"] = 2048;
+    request["stream"] = false;
+    request["temperature"] = 0.1;
+
+    var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request);
+    response.EnsureSuccessStatusCode();
+
+    var result = await response.Content.ReadFromJsonAsync<QwenChatResponseForReview>();
+    var choice = result?.Choices?.FirstOrDefault();
+
+    if (choice == null) throw new InvalidOperationException("Empty LLM response for tool call invocation.");
+
+    var assistantMsg = choice.Message;
+    string? content = assistantMsg?.Content;
+    List<QwenToolCallForReview>? toolCalls = assistantMsg?.ToolCalls ?? [];
+
+    // Try native OpenAI-style tool_calls first
+    if (toolCalls != null && toolCalls.Count > 0)
+    {
+        var tc = toolCalls[0];
+        Console.WriteLine($"LLM вернул инструмент: {tc.Function?.Name}");
+
+        // LLM returned a tool call — signal to caller that it should execute via MCP
+        return null; // signals: "execute get_merge_request_diffs via MCP manager"
+    }
+
+    // Try XML/backtick-style tool call blocks in response (qwen3.6 format)
+    if (!string.IsNullOrEmpty(content))
+    {
+        var patterns = new[]
+        {
+            new Regex(@"\u3400\n?(?<json>[\s\S]*?)\n?\u3401", RegexOptions.Compiled)
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var matches = pattern.Matches(content);
+
+            foreach (Match match in matches)
+            {
+                var rawJson = match.Groups["json"].Value.Trim();
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(rawJson);
+                    var root = doc.RootElement;
+
+                    if (root.TryGetProperty("name", out var nameProp) && root.TryGetProperty("arguments", out var argsProp))
+                    {
+                        if (nameProp.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                        {
+                            // LLM returned a tool call — signal to caller that it should execute via MCP
+                            return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                        }
+                    }
+                }
+                catch (JsonException) { /* skip invalid JSON */ }
+            }
+
+            if (matches.Count > 0) break;
+        }
+
+        // Fallback: try parsing entire response as JSON tool call (no wrapping)
+        var trimmed = content.Trim();
+        if (trimmed.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(trimmed);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("name", out var nameProp2) && root.TryGetProperty("arguments", out var argsProp2))
+                {
+                    if (nameProp2.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                    {
+                        // LLM returned a tool call — signal to caller that it should execute via MCP
+                        return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                    }
+                }
+            }
+            catch (JsonException) { /* not valid JSON */ }
+
+            // Also try Python-style: [name:"...",arguments:{...}] without wrapping
+            if (trimmed.StartsWith('['))
+            {
+                try
+                {
+                    var jsonStr = NormalizePythonStyleToJson(trimmed);
+                    using var doc = JsonDocument.Parse(jsonStr);
+                    var root = doc.RootElement;
+
+                    if (root.TryGetProperty("name", out var nameProp3) && root.TryGetProperty("arguments", out var argsProp3))
+                    {
+                        if (nameProp3.GetString() is "get_merge_request_diffs" or "getMergeRequestDiffs")
+                        {
+                            return null; // signals: "execute get_merge_request_diffs via MCP manager"
+                        }
+                    }
+                }
+                catch (JsonException) { /* not valid Python-style object, ignore */ }
+            }
+        }
+    }
+
+    throw new InvalidOperationException("LLM did not return a tool call for get_merge_request_diffs. Response: " + (content ?? "(empty)"));
+}
+
+static async Task<string> CallGetMergeRequestDiffViaMcpAsync(McpServerManager mcpManager, string projectId, string mergeRequestIid)
+{
+    var args = new Dictionary<string, object>
+    {
+        ["project_id"] = projectId,
+        ["merge_request_iid"] = mergeRequestIid
+    };
+
+    Console.WriteLine("Вызов инструмента get_merge_request_diffs...");
+
+    var result = await mcpManager.CallToolAsync("get_merge_request_diffs", args);
+
+    var formatted = McpToolMapper.FormatToolResult(result);
+    Console.WriteLine($"Результат: {formatted.Length} символов");
+
+    return formatted;
+}
+
+static string CleanReviewResponse(string rawAnswer)
+{
+    if (string.IsNullOrEmpty(rawAnswer)) return rawAnswer;
+
+    var text = rawAnswer.Trim();
+
+    // Remove JSON wrappers with recognized keys
+    if (text.StartsWith('{') && text.EndsWith('}'))
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("answer", out var answerProp))
+                return answerProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("comment", out var commentProp))
+                return commentProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("review", out var reviewProp))
+                return reviewProp.GetString()?.Trim() ?? text;
+
+            if (root.TryGetProperty("content", out var contentProp))
+                return contentProp.GetString()?.Trim() ?? text;
+
+            // If it's a simple JSON object with no recognized keys, return as-is
+        }
+        catch { /* not valid JSON */ }
+    }
+
+    // Remove markdown code block wrappers (```language ... ```)
+    var firstNewline = text.IndexOf('\n');
+    if (firstNewline > 0 && text.StartsWith("```"))
+        text = text[(firstNewline + 1)..];
+
+    var lastBackticks = text.LastIndexOf("```");
+    if (lastBackticks > 0 && lastBackticks < text.Length - 1)
+        text = text[..lastBackticks];
+
+    // Remove citation wrappers like [CITATION:0]...[/CITATION]
+    text = Regex.Replace(text, @"\[CITATION:\d+\].*?\[/CITATION\]", "", RegexOptions.Compiled);
+
+    return text.Trim();
+}
+
+static string NormalizePythonStyleToJson(string pythonStyle)
+{
+    var sb = new StringBuilder();
+
+    var trimmed = pythonStyle.Trim();
+    bool isList = trimmed.StartsWith('[');
+
+    if (isList)
+        sb.Append('{');
+    else
+        sb.Append(trimmed);
+
+    var text = isList ? trimmed[1..^1].Trim() : sb.ToString();
+
+    var result = new StringBuilder();
+    bool inString = false;
+    char escapeChar = '\0';
+
+    for (int i = 0; i < text.Length; i++)
+    {
+        char c = text[i];
+
+        if (inString)
+        {
+            result.Append(c);
+            if (c == escapeChar) inString = false;
+        }
+        else
+        {
+            if (c == '"' || c == '\'')
+            {
+                inString = true;
+                escapeChar = c;
+
+                if (i > 0)
+                {
+                    char prev = text[i - 1];
+                    if (prev == '{' || prev == ',')
+                    {
+                        int j = i;
+                        while (j < text.Length && (char.IsLetterOrDigit(text[j]) || text[j] == '_'))
+                            j++;
+
+                        int keyLen = j - i;
+                        if (keyLen > 0 && !char.IsDigit(text[i]))
+                        {
+                            string key = text.Substring(i, keyLen);
+
+                            int k = j;
+                            while (k < text.Length && char.IsWhiteSpace(text[k])) k++;
+
+                            if (k < text.Length && text[k] == ':') k++;
+                            while (k < text.Length && char.IsWhiteSpace(text[k])) k++;
+
+                            if (k < text.Length && (text[k] == '"' || text[k] == '\''))
+                            {
+                                char q = text[k];
+                                k++;
+                                while (k < text.Length && text[k] != q) k++;
+                                if (k < text.Length) k++;
+                            }
+                            else if (k < text.Length && char.IsLetterOrDigit(text[k]) || text[k] == '_')
+                            {
+                                while (k < text.Length && (char.IsLetterOrDigit(text[k]) || text[k] == '_')) k++;
+                            }
+
+                            string rawValue = text.Substring(j, k - j).Trim();
+
+                            if (k > 0 && (text[k - 1] == '"' || text[k - 1] == '\''))
+                            {
+                                result.Append($"\"{key}\":");
+                            }
+                            else if (rawValue == "null" || rawValue == "true" || rawValue == "false")
+                            {
+                                result.Append($"\"{key}\":{rawValue}");
+                            }
+                            else
+                            {
+                                result.Append($"\"{key}\":\"{rawValue}\"");
+                            }
+
+                            i = k - 1;
+                            continue;
+                        }
+                    }
+
+                    result.Append(c);
+                }
+                else
+                {
+                    result.Append(c);
+                }
+            }
+            else if (c == ':' && i > 0)
+            {
+                int j = i - 1;
+                while (j >= 0 && char.IsWhiteSpace(text[j])) j--;
+
+                if (j >= 0)
+                {
+                    int k = j;
+                    bool isUnquotedKey = true;
+
+                    while (k >= 0 && char.IsWhiteSpace(text[k])) k--;
+                    if (!char.IsLetterOrDigit(text[k]) && text[k] != '_') isUnquotedKey = false;
+
+                    if (isUnquotedKey)
+                    {
+                        while (k > 0)
+                        {
+                            k--;
+                            if (!char.IsLetterOrDigit(text[k]) && text[k] != '_') { k++; break; }
+                        }
+
+                        string key = text.Substring(k, j - k + 1);
+
+                        int m = i + 1;
+                        while (m < text.Length && char.IsWhiteSpace(text[m])) m++;
+
+                        if (m < text.Length && (text[m] == '"' || text[m] == '\''))
+                        {
+                            char q = text[m];
+                            m++;
+                            while (m < text.Length && text[m] != q) m++;
+                            if (m < text.Length) m++;
+
+                            result.Append($"\"{key}\":");
+                            i = m - 1;
+                            continue;
+                        }
+                        else if (m < text.Length && char.IsLetterOrDigit(text[m]) || text[m] == '_')
+                        {
+                            while (m < text.Length && (char.IsLetterOrDigit(text[m]) || text[m] == '_')) m++;
+
+                            string rawValue = text.Substring(i + 1, m - i - 1).Trim();
+                            if (rawValue == "null" || rawValue == "true" || rawValue == "false")
+                                result.Append($"\"{key}\":{rawValue}");
+                            else
+                                result.Append($"\"{key}\":\"{rawValue}\"");
+
+                            i = m - 1;
+                            continue;
+                        }
+                    }
+
+                    result.Append(c);
+                }
+            }
+            else
+            {
+                result.Append(c);
+            }
+        }
+    }
+
+    string finalText = isList ? result.ToString() + '}' : result.ToString();
+    return finalText;
+}
+
 static string NormalizeGitUrl(string url, string? token)
 {
     if (url.StartsWith("git@", StringComparison.Ordinal))
@@ -340,5 +1029,5 @@ static string NormalizeGitUrl(string url, string? token)
         return url.Replace(uri.Authority, $"oauth2:{token}@{uri.Authority}");
     }
 
-    throw new ArgumentException($"Unsupported URL scheme: {url}. Use SSH (git@...) or HTTPS.");
+throw new ArgumentException($"Unsupported URL scheme: {url}. Use SSH (git@...) or HTTPS.");
 }
