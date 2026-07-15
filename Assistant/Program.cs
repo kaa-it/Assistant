@@ -73,7 +73,7 @@ Console.WriteLine($"Repository URL: {repoUrl}");
 var resolvedTargetDir = Path.GetFullPath(targetDir);
 Console.WriteLine($"Target directory: {resolvedTargetDir}");
 
-bool isCloned = Directory.Exists(resolvedTargetDir);
+bool isCloned = Directory.Exists(resolvedTargetDir) && Directory.Exists(Path.Combine(resolvedTargetDir, ".git"));
 
 if (isCloned)
 {
