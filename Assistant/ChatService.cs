@@ -7,17 +7,20 @@ using ModelContextProtocol.Protocol;
 public class ChatService
 {
     private readonly ILlmService _llm;
-    private readonly EnhancedRagPipeline _rag;
-    private readonly CitationValidator _validator;
+    private readonly EnhancedRagPipeline? _rag;
+    private readonly CitationValidator? _validator;
     private const int MaxTokens = 200000;
 
     // MCP integration (optional)
     private readonly McpServerManager? _mcpManager;
 
+    // Path to the cloned repository (for LLM awareness)
+    private readonly string? _repoPath;
+
     public ChatService(
         ILlmService llm,
         EnhancedRagPipeline rag,
-        CitationValidator validator)
+        CitationValidator validator) : this(llm, rag: rag, validator: validator, mcpManager: null, repoPath: null)
     {
         _llm = llm;
         _rag = rag;
@@ -28,7 +31,7 @@ public class ChatService
         ILlmService llm,
         EnhancedRagPipeline rag,
         CitationValidator validator,
-        McpServerManager mcpManager) : this(llm, rag, validator)
+        McpServerManager mcpManager) : this(llm, rag: rag, validator: validator, mcpManager: mcpManager, repoPath: null)
     {
         _mcpManager = mcpManager;
 
@@ -36,10 +39,37 @@ public class ChatService
             Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
     }
 
-    public async Task<CitationAnswer> ProcessMessageAsync(string userMessage, ChatSession session, CancellationToken ct = default)
+    public ChatService(
+        ILlmService llm,
+        McpServerManager mcpManager) : this(llm, null, validator: null, mcpManager: mcpManager, repoPath: null)
     {
-        var ragResult = await _rag.ExecuteAsync(userMessage, RagPipelineMode.CitationEnforced, ct);
+        _llm = llm;
 
+        if (mcpManager.IsConnected && mcpManager.Tools != null)
+            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
+    }
+
+    public ChatService(
+        ILlmService llm,
+        EnhancedRagPipeline? rag,
+        CitationValidator? validator,
+        McpServerManager? mcpManager,
+        string? repoPath)
+    {
+        _llm = llm;
+        _rag = rag;
+        _validator = validator;
+        _mcpManager = mcpManager;
+        _repoPath = repoPath;
+
+        if (mcpManager?.IsConnected == true && mcpManager.Tools != null)
+            Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count}");
+    }
+
+    public string? RepoPath => _repoPath;
+
+    public async Task<CitationAnswer> ProcessMessageAsync(string userMessage, ChatSession session, bool useRag = true, CancellationToken ct = default)
+    {
         var systemPrompt = PromptBuilder.SystemPrompt;
 
         var history = session.GetHistoryContext(6);
@@ -51,8 +81,43 @@ public class ChatService
 
         bool hasMcpTools = _mcpManager?.IsConnected == true && _mcpManager.Tools != null;
 
-        if (ragResult.IsUnknown)
+        if (useRag)
         {
+            var ragResult = await _rag!.ExecuteAsync(userMessage, RagPipelineMode.CitationEnforced, ct);
+
+            if (ragResult.IsUnknown)
+            {
+                if (!hasMcpTools)
+                {
+                    parsedAnswer = await ProcessWithoutToolsAsync(userMessage, systemPrompt, null!, maxRetries, ct);
+                }
+                else
+                {
+                    parsedAnswer = await ProcessWithToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct);
+                }
+
+                goto end;
+            }
+            else
+            {
+                var userPrompt = PromptBuilder.BuildUserPrompt(userMessage, ragResult.Chunks, ragResult.Confidence);
+
+                
+                if (hasMcpTools)
+                {
+                    parsedAnswer = await ProcessWithToolCallingAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
+                }
+                else
+                {
+                    parsedAnswer = await ProcessWithoutToolsAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
+                }
+
+                goto end;
+            }
+        }
+        else
+        {
+            // Non-RAG mode: skip RAG pipeline, use MCP tools directly or direct LLM
             if (!hasMcpTools)
             {
                 parsedAnswer = await ProcessWithoutToolsAsync(userMessage, systemPrompt, null!, maxRetries, ct);
@@ -63,20 +128,6 @@ public class ChatService
             }
 
             goto end;
-        }
-        else
-        {
-            var userPrompt = PromptBuilder.BuildUserPrompt(userMessage, ragResult.Chunks, ragResult.Confidence);
-
-            if (hasMcpTools)
-            {
-                Console.WriteLine("Process with LLM");
-                parsedAnswer = await ProcessWithToolCallingAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
-            }
-            else
-            {
-                parsedAnswer = await ProcessWithoutToolsAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
-            }
         }
 
         end:
@@ -109,22 +160,41 @@ public class ChatService
         // Build system prompt with tools embedded for native MCP support via chat template.
         // The model receives tool definitions as part of the system message, enabling native tool calling.
         var effectiveSystemPrompt = systemPrompt;
+
+        // Determine the correct base prompt based on whether RAG is being used
         if (ragResult == null)
-            effectiveSystemPrompt = PromptBuilder.FallbackSystemPrompt;
+        {
+            // Check if this is a non-RAG mode (no _rag instance) vs RAG mode with unknown result
+            if (_rag == null)
+            {
+                // Non-RAG mode: use MCP-only prompt (no RAG references)
+                effectiveSystemPrompt = PromptBuilder.McpOnlySystemPrompt;
+            }
+            else
+            {
+                // RAG mode with unknown result: use fallback prompt (mentions indexed project)
+                effectiveSystemPrompt = PromptBuilder.FallbackSystemPrompt;
+            }
+        }
 
         // Embed MCP tools into the system prompt for native chat template support
         var hasMcpTools = _mcpManager?.IsConnected == true && _mcpManager.Tools != null;
         if (hasMcpTools)
         {
             effectiveSystemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools("", _mcpManager.Tools);
-            Console.WriteLine(effectiveSystemPrompt);
+        }
+
+        // Inform LLM about the repository path so it can pass it in tool calls
+        if (!string.IsNullOrEmpty(_repoPath))
+        {
+            effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
         }
 
         var messages = new List<Dictionary<string, object>>();
         messages.Add(new Dictionary<string, object> { ["role"] = "system", ["content"] = effectiveSystemPrompt });
 
         var userMessageContent = ragResult != null ? BuildUserMessageWithChunks(userPrompt) : userPrompt;
-        messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = "Какие ветки есть в проекте?"});
+        messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = userMessageContent});
 
         var currentRagResult = ragResult;
         CitationAnswer? lastParsedAnswer = null;
@@ -143,8 +213,6 @@ public class ChatService
             request["stream"] = false;
             request["temperature"] = 0.2;
             request["top_p"] = 0.9;
-
-            Console.WriteLine("Request");
 
             var response = await httpClient.PostAsJsonAsync("/v1/chat/completions", request, ct);
             response.EnsureSuccessStatusCode();
@@ -409,7 +477,16 @@ public class ChatService
         {
             try
             {
-                var effectiveSystemPrompt = ragResult == null ? PromptBuilder.FallbackSystemPrompt : systemPrompt;
+                var effectiveSystemPrompt = ragResult == null
+                    ? (_rag == null ? PromptBuilder.McpOnlySystemPrompt : PromptBuilder.FallbackSystemPrompt)
+                    : systemPrompt;
+
+                // Inform LLM about the repository path so it can pass it in tool calls
+                if (!string.IsNullOrEmpty(_repoPath))
+                {
+                    effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
+                }
+
                 var rawResponse = await _llm.AskAsync(userPrompt, effectiveSystemPrompt, MaxTokens, ct);
 
                 parsedAnswer = ragResult != null
@@ -564,7 +641,7 @@ public class ChatService
 
             try
             {
-                var answer = await ProcessMessageAsync(question, session, ct);
+                var answer = await ProcessMessageAsync(question, session, useRag: isQueryCommand, ct);
                 session.AddAssistantMessage(answer);
 
                 if (answer.Confidence == ConfidenceLevel.Unknown && answer.ClarificationRequest != null)
@@ -664,8 +741,9 @@ public class ChatService
         // and backtick-style: ```\n{...}\n``` or ```\n[...]\n```
         var patterns = new[]
         {
-            new Regex(@"<code\s+language=""?function_call""?\s*?>\s*\n?(?<json>[\s\S]*?)\s*</code>", RegexOptions.Compiled, TimeSpan.FromSeconds(5)),
-            new Regex(@"```\n?(?<json>[\s\S]*?)\n?```", RegexOptions.Compiled, TimeSpan.FromSeconds(5))
+            //new Regex(@"<code\s+language=""?function_call""?\s*?>\s*\n?(?<json>[\s\S]*?)\s*</code>", RegexOptions.Compiled, TimeSpan.FromSeconds(5)),
+            //new Regex(@"```\n?(?<json>[\s\S]*?)\n?```", RegexOptions.Compiled, TimeSpan.FromSeconds(5)),
+            new Regex(@"<tool_call>\n?(?<json>[\s\S]*?)\n?</tool_call>", RegexOptions.Compiled, TimeSpan.FromSeconds(5))
         };
 
         foreach (var pattern in patterns)
@@ -704,12 +782,11 @@ public class ChatService
                 using var doc = JsonDocument.Parse(jsonStr);
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("name", out var nameProp) && root.TryGetProperty("function", out var funcProp))
+                if (root.TryGetProperty("name", out var nameProp))
                 {
                     var callObj = new Dictionary<string, object>
                     {
                         ["name"] = nameProp.GetString() ?? "",
-                        ["function"] = funcProp.GetString() ?? ""
                     };
 
                     if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)

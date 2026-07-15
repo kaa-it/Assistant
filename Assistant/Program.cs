@@ -70,78 +70,104 @@ if (isHttps)
 }
 
 Console.WriteLine($"Repository URL: {repoUrl}");
-Console.WriteLine($"Target directory: {Path.GetFullPath(targetDir)}");
+var resolvedTargetDir = Path.GetFullPath(targetDir);
+Console.WriteLine($"Target directory: {resolvedTargetDir}");
 
-var normalizedUrl = NormalizeGitUrl(repoUrl, token);
-Console.WriteLine($"Normalized URL: {normalizedUrl}");
+bool isCloned = Directory.Exists(resolvedTargetDir);
 
-var startInfo = new ProcessStartInfo
+if (isCloned)
 {
-    FileName = "git",
-    Arguments = $"clone \"{normalizedUrl}\" \"{targetDir}\"",
-    UseShellExecute = false,
-    RedirectStandardOutput = true,
-    RedirectStandardError = true,
-    StandardOutputEncoding = Encoding.UTF8,
-    StandardErrorEncoding = Encoding.UTF8,
-};
+    Console.WriteLine($"Repository already cloned to: {targetDir}");
 
-using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to start git process.");
-
-var outputBuilder = new StringBuilder();
-var errorBuilder = new StringBuilder();
-
-process.OutputDataReceived += (_, e) =>
-{
-    if (e.Data is not null)
-        outputBuilder.AppendLine(e.Data);
-};
-
-process.ErrorDataReceived += (_, e) =>
-{
-    if (e.Data is not null)
-        errorBuilder.AppendLine(e.Data);
-};
-
-process.BeginOutputReadLine();
-process.BeginErrorReadLine();
-
-if (!process.WaitForExit(300_000))
-{
-    Console.Error.WriteLine("Error: Git clone timed out after 5 minutes.");
-    process.Kill();
-    Environment.ExitCode = 1;
-    return;
-}
-
-string output = outputBuilder.ToString().TrimEnd();
-string error = errorBuilder.ToString().TrimEnd();
-
-if (process.ExitCode == 0)
-{
-    Console.WriteLine($"Successfully cloned repository to: {Path.GetFullPath(targetDir)}");
-
-    if (!string.IsNullOrWhiteSpace(output))
-        Console.WriteLine(output);
-
-    // === ИНДЕКСАЦИЯ (после успешного git clone) ===
-    await RunIndexingAsync(targetDir, runChat);
+    // === ИНДЕКСАЦИЯ (пропускаем клонирование) ===
+    await RunIndexingAsync(targetDir, runChat, resolvedTargetDir);
 }
 else
 {
-    Console.Error.WriteLine($"Error: Git clone failed with exit code {process.ExitCode}.");
+    var normalizedUrl = NormalizeGitUrl(repoUrl, token);
+    Console.WriteLine($"Normalized URL: {normalizedUrl}");
 
-    if (!string.IsNullOrWhiteSpace(error))
-        Console.Error.WriteLine(error);
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = "git",
+        Arguments = $"clone \"{normalizedUrl}\" \"{targetDir}\"",
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        StandardOutputEncoding = Encoding.UTF8,
+        StandardErrorEncoding = Encoding.UTF8,
+    };
 
-    Environment.ExitCode = 1;
+    using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to start git process.");
+
+    var outputBuilder = new StringBuilder();
+    var errorBuilder = new StringBuilder();
+
+    process.OutputDataReceived += (_, e) =>
+    {
+        if (e.Data is not null)
+            outputBuilder.AppendLine(e.Data);
+    };
+
+    process.ErrorDataReceived += (_, e) =>
+    {
+        if (e.Data is not null)
+            errorBuilder.AppendLine(e.Data);
+    };
+
+    process.BeginOutputReadLine();
+    process.BeginErrorReadLine();
+
+    if (!process.WaitForExit(300_000))
+    {
+        Console.Error.WriteLine("Error: Git clone timed out after 5 minutes.");
+        process.Kill();
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    string output = outputBuilder.ToString().TrimEnd();
+    string error = errorBuilder.ToString().TrimEnd();
+
+    if (process.ExitCode == 0)
+    {
+        Console.WriteLine($"Successfully cloned repository to: {Path.GetFullPath(targetDir)}");
+
+        if (!string.IsNullOrWhiteSpace(output))
+            Console.WriteLine(output);
+
+        // === ИНДЕКСАЦИЯ (после успешного git clone) ===
+        await RunIndexingAsync(targetDir, runChat, resolvedTargetDir);
+    }
+    else
+    {
+        Console.Error.WriteLine($"Error: Git clone failed with exit code {process.ExitCode}.");
+
+        if (!string.IsNullOrWhiteSpace(error))
+            Console.Error.WriteLine(error);
+
+        Environment.ExitCode = 1;
+    }
 }
 
-static async Task RunIndexingAsync(string targetDir, bool runChat)
+static async Task RunIndexingAsync(string targetDir, bool runChat, string resolvedTargetDir)
 {
-    Console.WriteLine("\n=== Запуск индексации ===");
-
     var dbPath = Path.Combine(Path.GetFullPath(targetDir), "document_index.db");
+
+    if (File.Exists(dbPath))
+    {
+        Console.WriteLine($"\nИндекс уже существует: {dbPath}");
+
+        if (runChat)
+        {
+            Console.WriteLine("\n=== Запуск интерактивного чата ===");
+            await RunChatAsync(targetDir, dbPath, resolvedTargetDir);
+        }
+
+        return;
+    }
+
+    Console.WriteLine("\n=== Запуск индексации ===");
     var store = new SqliteVectorStore(dbPath);
     await store.InitializeAsync();
 
@@ -195,11 +221,11 @@ static async Task RunIndexingAsync(string targetDir, bool runChat)
     if (runChat)
     {
         Console.WriteLine("\n=== Запуск интерактивного чата ===");
-        await RunChatAsync(targetDir, dbPath);
+        await RunChatAsync(targetDir, dbPath, resolvedTargetDir);
     }
 }
 
-static async Task RunChatAsync(string targetDir, string dbPath)
+static async Task RunChatAsync(string targetDir, string dbPath, string resolvedTargetDir)
 {
     var store = new SqliteVectorStore(dbPath);
     await store.InitializeAsync();
@@ -251,9 +277,19 @@ static async Task RunChatAsync(string targetDir, string dbPath)
     }
     catch { /* MCP connection is optional, continue without it */ }
 
-    var chat = mcpManager != null && mcpManager.IsConnected
-        ? new ChatService(llm, rag, validator, mcpManager)
-        : new ChatService(llm, rag, validator);
+    ChatService chat;
+    if (mcpManager != null && mcpManager.IsConnected)
+    {
+        chat = new ChatService(llm, rag, validator, mcpManager, resolvedTargetDir);
+    }
+    else if (rag != null)
+    {
+        chat = new ChatService(llm, rag, validator);
+    }
+    else
+    {
+        chat = new ChatService(llm, mcpManager);
+    }
 
     try { await chat.RunInteractiveAsync(); }
     finally

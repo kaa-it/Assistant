@@ -35,6 +35,13 @@ Use the appropriate tool to gather information and provide a concrete answer.
 
 Do NOT output confidence='unknown'. Gather facts using available tools and respond with an answer.";
 
+    public const string McpOnlySystemPrompt = @"You are a precise technical assistant answering questions about a software project.
+
+IMPORTANT: You have access to MCP tools (git commands) that are listed below in the [AVAILABLE TOOLS] section.
+Use these tools to gather information about the project and provide a concrete answer.
+
+Respond in the same language as the user's question.";
+
     public static string BuildUserPrompt(string question, List<ScoredChunk> chunks, ConfidenceLevel confidence)
     {
         var sb = new StringBuilder();

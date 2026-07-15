@@ -10,7 +10,7 @@ using ModelContextProtocol.Client;
 public static class ToolPromptBuilder
 {
     public const string ToolsSectionPrefix = "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
-    public const string ToolsSectionSuffix = """</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags: <tool_call>{"name": <function-name>, "arguments": <args-json-object>}</tool_call>\n""";
+    public const string ToolsSectionSuffix = """</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags: <tool_call>{"name": "<function-name>", "arguments": <args-json-object>}</tool_call>\n""";
 
     /// <summary>
     /// Builds a tool instructions string from MCP tools, formatted for the Qwen chat template.
