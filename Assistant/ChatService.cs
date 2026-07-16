@@ -117,15 +117,16 @@ public class ChatService
             }
             else
             {
-                var userPrompt = PromptBuilder.BuildUserPrompt(userMessage, ragResult.Chunks, ragResult.Confidence);
-
-                
                 if (hasMcpTools)
                 {
-                    parsedAnswer = await ProcessWithToolCallingAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
+                    // Include RAG chunks as context but without "RAW JSON only" instructions
+                    // that conflict with tool calling
+                    var userPromptForTools = PromptBuilder.BuildUserPromptForTools(userMessage, ragResult.Chunks, ragResult.Confidence);
+                    parsedAnswer = await ProcessWithToolCallingAsync(userPromptForTools, systemPrompt, ragResult, maxRetries, ct);
                 }
                 else
                 {
+                    var userPrompt = PromptBuilder.BuildUserPrompt(userMessage, ragResult.Chunks, ragResult.Confidence);
                     parsedAnswer = await ProcessWithoutToolsAsync(userPrompt, systemPrompt, ragResult, maxRetries, ct);
                 }
 
@@ -168,7 +169,7 @@ public class ChatService
         using var httpClient = new HttpClient
         {
             BaseAddress = new Uri(llmApiUrl),
-            Timeout = TimeSpan.FromSeconds(120)
+            Timeout = TimeSpan.FromSeconds(1620)
         };
 
         if (!string.IsNullOrEmpty(llmApiKey))
@@ -198,7 +199,10 @@ public class ChatService
         var hasMcpTools = _mcpManager?.IsConnected == true && _mcpManager.Tools != null;
         if (hasMcpTools)
         {
-            effectiveSystemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools("", _mcpManager.Tools);
+            var basePrompt = ragResult == null
+                ? PromptBuilder.McpOnlySystemPrompt
+                : PromptBuilder.FallbackSystemPrompt;
+            effectiveSystemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools(basePrompt, _mcpManager.Tools);
         }
 
         // Inform LLM about the repository path so it can pass it in tool calls
@@ -367,13 +371,28 @@ public class ChatService
                     }
 
                     currentRagResult = null;
+                    continue;
                 }
                 else
                 {
                     if (currentRagResult != null)
-                        lastParsedAnswer = CitationAnswerParser.Parse(rawResponse, currentRagResult.Chunks);
-
-                    if (currentRagResult == null)
+                    {
+                        try
+                        {
+                            lastParsedAnswer = CitationAnswerParser.Parse(rawResponse, currentRagResult.Chunks);
+                        }
+                        catch (JsonException)
+                        {
+                            lastParsedAnswer = new CitationAnswer(
+                                Answer: rawResponse.Trim(),
+                                Confidence: ConfidenceLevel.High,
+                                ClarificationRequest: null,
+                                Sources: [],
+                                Citations: []
+                            );
+                        }
+                    }
+                    else
                     {
                         lastParsedAnswer = new CitationAnswer(
                             Answer: rawResponse.Trim(),
@@ -766,148 +785,121 @@ public class ChatService
     {
         var results = new List<Dictionary<string, object>>();
 
-        // Match both XML-style: <code language="function_call">...</code>
-        // and backtick-style: ```\n{...}\n``` or ```\n[...]\n```
-        var patterns = new[]
+        // Step 1: try regex for properly closed tags: <tool_call>...</tool_call>
+        var closedPattern = new Regex(@"<tool_call>\n?(?<json>[\s\S]*?)\n?</tool_call>", RegexOptions.Compiled, TimeSpan.FromSeconds(5));
+        var matches = closedPattern.Matches(response);
+        foreach (Match match in matches)
         {
-            //new Regex(@"<code\s+language=""?function_call""?\s*?>\s*\n?(?<json>[\s\S]*?)\s*</code>", RegexOptions.Compiled, TimeSpan.FromSeconds(5)),
-            //new Regex(@"```\n?(?<json>[\s\S]*?)\n?```", RegexOptions.Compiled, TimeSpan.FromSeconds(5)),
-            new Regex(@"<tool_call>\n?(?<json>[\s\S]*?)\n?</tool_call>", RegexOptions.Compiled, TimeSpan.FromSeconds(5))
-        };
-
-        foreach (var pattern in patterns)
-        {
-            var matches = pattern.Matches(response);
-            foreach (Match match in matches)
-            {
-                var rawJson = match.Groups["json"].Value.Trim();
-
-                string jsonStr;
-                try
-                {
-                    // Try parsing as-is first (valid JSON)
-                    using var _ = JsonDocument.Parse(rawJson);
-                    jsonStr = rawJson;
-                }
-                catch (JsonException)
-                {
-                    // LLM may output Python-style: ["name":"git_branch","function":"..."]
-                    // Convert to valid JSON: {"name":"git_branch","function":"..."}
-                    jsonStr = NormalizePythonStyleToJson(rawJson);
-
-                    try
-                    {
-                        using var _ = JsonDocument.Parse(jsonStr);
-                    }
-                    catch (JsonException)
-                    {
-                        string repaired = rawJson.TrimEnd();
-                        bool fixed_ = false;
-                        while (repaired.Length > 1 && repaired.EndsWith('}'))
-                        {
-                            repaired = repaired[..^1].TrimEnd();
-                            try
-                            {
-                                using var __ = JsonDocument.Parse(repaired);
-                                jsonStr = repaired;
-                                fixed_ = true;
-                                break;
-                            }
-                            catch (JsonException) { }
-                        }
-
-                        if (!fixed_)
-                        {
-                            Console.ForegroundColor = ConsoleColor.Red;
-                            Console.WriteLine($"Ошибка парсинга tool call блока: {rawJson}");
-                            Console.ResetColor();
-                            continue;
-                        }
-                    }
-                }
-
-                using var doc = JsonDocument.Parse(jsonStr);
-                var root = doc.RootElement;
-
-                if (root.TryGetProperty("name", out var nameProp))
-                {
-                    var callObj = new Dictionary<string, object>
-                    {
-                        ["name"] = nameProp.GetString() ?? "",
-                    };
-
-                    if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
-                    {
-                        callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp);
-                    }
-
-                    results.Add(callObj);
-                }
-            }
-
-            if (results.Count > 0) break;
+            var parsed = TryParseToolCallJson(match.Groups["json"].Value.Trim());
+            if (parsed != null) results.Add(parsed);
         }
 
-        // Fallback: try parsing the entire response as a JSON tool call (no XML/backtick wrapping)
+        // Step 2: if no results, try splitting by <tool_call> to handle unclosed tags
+        if (results.Count == 0 && response.Contains("<tool_call>"))
+        {
+            var parts = response.Split("<tool_call>", StringSplitOptions.None);
+            for (int i = 1; i < parts.Length; i++)
+            {
+                var segment = parts[i];
+                var closeIdx = segment.IndexOf("</tool_call>");
+                if (closeIdx >= 0)
+                    segment = segment[..closeIdx];
+
+                segment = segment.Trim();
+                if (string.IsNullOrEmpty(segment)) continue;
+
+                var parsed = TryParseToolCallJson(segment);
+                if (parsed != null) results.Add(parsed);
+            }
+        }
+
+        // Fallback: try parsing the entire response as a single JSON tool call
         if (results.Count == 0)
         {
-            string trimmed = response.Trim();
-            if (trimmed.StartsWith('{'))
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(trimmed);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("name", out var nameProp) && root.TryGetProperty("function", out var funcProp))
-                    {
-                        var callObj = new Dictionary<string, object>
-                        {
-                            ["name"] = nameProp.GetString() ?? "",
-                            ["function"] = funcProp.GetString() ?? ""
-                        };
-
-                        if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
-                        {
-                            callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp);
-                        }
-
-                        results.Add(callObj);
-                    }
-                }
-                catch (JsonException) { /* not a valid JSON object, ignore */ }
-            }
-
-            // Also try Python-style: [name:"...",function:"..."] without wrapping
-            if (results.Count == 0 && trimmed.StartsWith('['))
-            {
-                try
-                {
-                    string jsonStr = NormalizePythonStyleToJson(trimmed);
-                    using var doc = JsonDocument.Parse(jsonStr);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("name", out var nameProp2) && root.TryGetProperty("function", out var funcProp2))
-                    {
-                        var callObj = new Dictionary<string, object>
-                        {
-                            ["name"] = nameProp2.GetString() ?? "",
-                            ["function"] = funcProp2.GetString() ?? ""
-                        };
-
-                        if (root.TryGetProperty("arguments", out var argsProp2) && argsProp2.ValueKind == JsonValueKind.Object)
-                        {
-                            callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp2);
-                        }
-
-                        results.Add(callObj);
-                    }
-                }
-                catch (JsonException) { /* not a valid Python-style object, ignore */ }
-            }
+            var parsed = TryParseToolCallJson(response.Trim());
+            if (parsed != null) results.Add(parsed);
         }
 
         return results.Count > 0 ? results : null;
+    }
+
+    private static Dictionary<string, object>? TryParseToolCallJson(string rawJson)
+    {
+        if (string.IsNullOrWhiteSpace(rawJson)) return null;
+
+        string jsonStr;
+        try
+        {
+            using var _ = JsonDocument.Parse(rawJson);
+            jsonStr = rawJson;
+        }
+        catch (JsonException)
+        {
+            // Repair step 1: fix unquoted values like "name":read_file -> "name":"read_file"
+            var repaired = Regex.Replace(rawJson, @":\s*([a-zA-Z_][a-zA-Z0-9_\-\.\/]*)", @":""$1""");
+
+            // Repair step 2: unescape LLM's backslash-quotes: \" -> "
+            repaired = repaired.Replace("\\\"", "\"");
+
+            try
+            {
+                using var _ = JsonDocument.Parse(repaired);
+                jsonStr = repaired;
+                goto parsed;
+            }
+            catch (JsonException) { }
+
+            // Repair step 3: try unescape only (without unquoted-value fix)
+            var unescaped = rawJson.Replace("\\\"", "\"");
+            try
+            {
+                using var _ = JsonDocument.Parse(unescaped);
+                jsonStr = unescaped;
+                goto parsed;
+            }
+            catch (JsonException) { }
+
+            jsonStr = NormalizePythonStyleToJson(rawJson);
+            try
+            {
+                using var _ = JsonDocument.Parse(jsonStr);
+            }
+            catch (JsonException)
+            {
+                string trimmed = rawJson.TrimEnd();
+                while (trimmed.Length > 1 && trimmed.EndsWith('}'))
+                {
+                    trimmed = trimmed[..^1].TrimEnd();
+                    try
+                    {
+                        using var __ = JsonDocument.Parse(trimmed);
+                        jsonStr = trimmed;
+                        goto parsed;
+                    }
+                    catch (JsonException) { }
+                }
+                return null;
+            }
+        }
+
+        parsed:
+        using var doc = JsonDocument.Parse(jsonStr);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("name", out var nameProp))
+            return null;
+
+        var callObj = new Dictionary<string, object>
+        {
+            ["name"] = nameProp.GetString() ?? "",
+        };
+
+        if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
+        {
+            callObj["arguments"] = McpToolMapper.ParseJsonElement(argsProp);
+        }
+
+        return callObj;
     }
 
     private static string NormalizePythonStyleToJson(string pythonStyle)

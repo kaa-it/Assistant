@@ -19,7 +19,7 @@ public class OpenAiCompatibleLlmService : ILlmService
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(url),
-            Timeout = TimeSpan.FromSeconds(120)
+            Timeout = TimeSpan.FromSeconds(1620)
         };
 
         var key = apiKey ?? Environment.GetEnvironmentVariable("LLM_API_KEY");

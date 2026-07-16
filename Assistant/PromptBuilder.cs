@@ -30,15 +30,13 @@ OUTPUT FORMAT — strict JSON with these exact keys:
     public const string FallbackSystemPrompt = @"You are a precise technical assistant answering questions about an indexed software project.
 No relevant documentation context was found for this query in the RAG index.
 
-IMPORTANT: You have access to MCP tools that are listed below in the [AVAILABLE TOOLS] section.
-Use the appropriate tool to gather information and provide a concrete answer.
+You have access to MCP tools listed below. Use the appropriate tool(s) to gather information or perform actions as requested by the user. Always use tools when they can help answer the question or fulfill the request.
 
 Do NOT output confidence='unknown'. Gather facts using available tools and respond with an answer.";
 
     public const string McpOnlySystemPrompt = @"You are a precise technical assistant answering questions about a software project.
 
-IMPORTANT: You have access to MCP tools (git commands) that are listed below in the [AVAILABLE TOOLS] section.
-Use these tools to gather information about the project and provide a concrete answer.
+You have access to MCP tools listed below. Use the appropriate tool(s) to gather information or perform actions as requested by the user. Always use tools when they can help answer the question or fulfill the request.
 
 Respond in the same language as the user's question.";
 
@@ -74,6 +72,27 @@ Respond in the same language as the user's question.";
         sb.AppendLine("4. If confidence is 'unknown', set answer to empty string and provide clarification_request.");
         sb.AppendLine("5. The 'quote' in each citation MUST be an exact substring of the corresponding chunk content.");
         sb.AppendLine("6. The 'source_index' in each citation MUST match the index of the source in the sources array.");
+
+        return sb.ToString();
+    }
+
+    public static string BuildUserPromptForTools(string question, List<ScoredChunk> chunks, ConfidenceLevel confidence)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"User question: {question}");
+        sb.AppendLine();
+        sb.AppendLine("Relevant context from the indexed project (you may also use MCP tools for additional information):");
+        sb.AppendLine("============================================");
+
+        for (int i = 0; i < chunks.Count; i++)
+        {
+            var c = chunks[i];
+            sb.AppendLine($"--- [{i}] {c.Chunk.Source} ---");
+            sb.AppendLine(c.Chunk.Content);
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("============================================");
 
         return sb.ToString();
     }

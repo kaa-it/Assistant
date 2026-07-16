@@ -250,7 +250,7 @@ static async Task RunIndexingAsync(string targetDir, bool runChat, string resolv
         return;
     }
 
-    var extensions = new[] { ".txt", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
+    var extensions = new[] { ".txt", ".rs", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
 
     // Индексация: FixedSize
     Console.WriteLine("\nИндексация: Fixed Size Strategy (chunk=512, overlap=50)");
@@ -337,6 +337,10 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
             mcpManager.AddServer("zereight-mcp-gitlab", "zereight-mcp-gitlab",
                 new[] { "--token=" + gitlabToken, "--api-url=" + gitlabApiUrl });
         }
+
+        // Filesystem MCP server (npx @modelcontextprotocol/server-filesystem)
+        mcpManager.AddServer("filesystem", "npx",
+            new[] { "-y", "@modelcontextprotocol/server-filesystem", resolvedTargetDir });
 
         await mcpManager.ConnectAsync();
     }
@@ -486,7 +490,7 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
             {
                 Console.WriteLine("Попытка прямого вызова GitLab API...");
 
-                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(120) };
+                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(700) };
                 httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", gitlabToken);
                 httpClient.DefaultRequestHeaders.Add("PRIVATE-TOKEN", gitlabToken);
 
@@ -532,7 +536,7 @@ static async Task RunReviewAsync(string targetDir, string resolvedTargetDir, str
             {
                 Console.WriteLine("Попытка прямого вызова GitLab API...");
 
-                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(120) };
+                using var httpClient = new HttpClient { BaseAddress = new Uri(gitlabApiUrl), Timeout = TimeSpan.FromSeconds(700) };
                 httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", gitlabToken);
                 httpClient.DefaultRequestHeaders.Add("PRIVATE-TOKEN", gitlabToken);
 
@@ -688,7 +692,7 @@ static async Task<string?> InvokeReviewToolCallViaLlmAsync(
     using var httpClient = new HttpClient
     {
         BaseAddress = new Uri(llmApiUrl),
-        Timeout = TimeSpan.FromSeconds(120)
+        Timeout = TimeSpan.FromSeconds(700)
     };
 
     if (!string.IsNullOrEmpty(llmApiKey))
@@ -971,7 +975,7 @@ static async Task<bool> PostReviewCommentViaMcpAsync(
     using var httpClient = new HttpClient
     {
         BaseAddress = new Uri(llmApiUrl),
-        Timeout = TimeSpan.FromSeconds(120)
+        Timeout = TimeSpan.FromSeconds(700)
     };
 
     if (!string.IsNullOrEmpty(llmApiKey))
