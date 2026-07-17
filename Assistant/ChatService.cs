@@ -2,14 +2,17 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using Anthropic;
+using Anthropic.Models.Messages;
 using ModelContextProtocol.Protocol;
+using AnthropicRole = Anthropic.Models.Messages.Role;
 
 public class ChatService
 {
     private readonly ILlmService _llm;
     private readonly EnhancedRagPipeline? _rag;
     private readonly CitationValidator? _validator;
-    private const int MaxTokens = 200000;
+    private const int MaxTokens = 50000;
 
     // MCP integration (optional)
     private readonly McpServerManager? _mcpManager;
@@ -19,6 +22,11 @@ public class ChatService
 
     // GitLab project ID (for LLM awareness in chat mode)
     private readonly string? _projectId;
+
+    // Anthropic integration (optional)
+    private readonly AnthropicClient? _anthropicClient;
+    private readonly string? _anthropicModel;
+    private readonly bool _useAnthropic;
 
     public ChatService(
         ILlmService llm,
@@ -59,7 +67,9 @@ public class ChatService
         CitationValidator validator,
         McpServerManager mcpManager,
         string? repoPath,
-        string? projectId = null)
+        string? projectId = null,
+        AnthropicClient? anthropicClient = null,
+        string? anthropicModel = null)
     {
         _llm = llm;
         _rag = rag;
@@ -67,6 +77,9 @@ public class ChatService
         _mcpManager = mcpManager;
         _repoPath = repoPath;
         _projectId = projectId;
+        _anthropicClient = anthropicClient;
+        _anthropicModel = anthropicModel;
+        _useAnthropic = anthropicClient != null;
 
         if (mcpManager?.IsConnected == true && mcpManager.Tools != null)
             Console.WriteLine($"\nИнструменты MCP доступны: {mcpManager.Tools.Count} (серверов: {mcpManager.ServerCount})");
@@ -110,7 +123,9 @@ public class ChatService
                 }
                 else
                 {
-                    parsedAnswer = await ProcessWithToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct);
+                    parsedAnswer = _useAnthropic
+                        ? await ProcessWithAnthropicToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct)
+                        : await ProcessWithToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct);
                 }
 
                 goto end;
@@ -122,7 +137,9 @@ public class ChatService
                     // Include RAG chunks as context but without "RAW JSON only" instructions
                     // that conflict with tool calling
                     var userPromptForTools = PromptBuilder.BuildUserPromptForTools(userMessage, ragResult.Chunks, ragResult.Confidence);
-                    parsedAnswer = await ProcessWithToolCallingAsync(userPromptForTools, systemPrompt, ragResult, maxRetries, ct);
+                    parsedAnswer = _useAnthropic
+                        ? await ProcessWithAnthropicToolCallingAsync(userPromptForTools, systemPrompt, ragResult, maxRetries, ct)
+                        : await ProcessWithToolCallingAsync(userPromptForTools, systemPrompt, ragResult, maxRetries, ct);
                 }
                 else
                 {
@@ -142,7 +159,9 @@ public class ChatService
             }
             else
             {
-                parsedAnswer = await ProcessWithToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct);
+                parsedAnswer = _useAnthropic
+                    ? await ProcessWithAnthropicToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct)
+                    : await ProcessWithToolCallingAsync(userMessage, systemPrompt, null, maxRetries, ct);
             }
 
             goto end;
@@ -498,6 +517,222 @@ public class ChatService
         }
 
         lastParsedAnswer ??= (ragResult != null) 
+            ? CreateFallbackAnswer(ragResult, "All retries failed.")
+            : new CitationAnswer(
+                Answer: "Unable to generate an answer. Please try again.",
+                Confidence: ConfidenceLevel.Unknown,
+                ClarificationRequest: "All retries failed. No context was available.",
+                Sources: [],
+                Citations: []
+            );
+        return lastParsedAnswer;
+    }
+
+    private async Task<CitationAnswer> ProcessWithAnthropicToolCallingAsync(
+        string userPrompt, string systemPrompt, RagResult? ragResult, int maxRetries, CancellationToken ct)
+    {
+        var anthropicTools = AnthropicToolMapper.ConvertToAnthropicTools(_mcpManager!.Tools!);
+
+        var effectiveSystemPrompt = ragResult == null
+            ? (_rag == null ? PromptBuilder.McpOnlySystemPrompt : PromptBuilder.FallbackSystemPrompt)
+            : systemPrompt;
+
+        effectiveSystemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools(effectiveSystemPrompt, _mcpManager.Tools!);
+
+        if (!string.IsNullOrEmpty(_repoPath))
+            effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
+
+        if (!string.IsNullOrEmpty(_projectId))
+            effectiveSystemPrompt += $"\n\n[PROJECT ID: {_projectId}]";
+
+        var messages = new List<MessageParam>();
+        messages.Add(new MessageParam
+        {
+            Role = AnthropicRole.User,
+            Content = effectiveSystemPrompt + "\n\n" + (ragResult != null ? BuildUserMessageWithChunks(userPrompt) : userPrompt)
+        });
+
+        var currentRagResult = ragResult;
+        CitationAnswer? lastParsedAnswer = null;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            var parameters = new MessageCreateParams
+            {
+                Model = _anthropicModel!,
+                MaxTokens = MaxTokens,
+                System = effectiveSystemPrompt,
+                Messages = messages,
+                Tools = anthropicTools,
+            };
+
+            var response = await _anthropicClient!.Messages.Create(parameters, ct);
+
+            var toolUseBlocks = response.Content
+                .Select(block => block.Value)
+                .OfType<ToolUseBlock>()
+                .ToList();
+
+            if (toolUseBlocks.Count > 0)
+            {
+                Console.WriteLine($"\nAnthropic запросил(а) {toolUseBlocks.Count} инструмент(ов)...");
+
+                var assistantBlocks = new List<ContentBlockParam>();
+                foreach (var block in response.Content)
+                {
+                    if (block.Value is ToolUseBlock tb)
+                    {
+                        assistantBlocks.Add(new ContentBlockParam(
+                            new ToolUseBlockParam
+                            {
+                                ID = tb.ID,
+                                Name = tb.Name,
+                                Input = tb.Input,
+                                Type = JsonSerializer.SerializeToElement("tool_use")
+                            }));
+                    }
+                }
+
+                messages.Add(new MessageParam
+                {
+                    Role = AnthropicRole.Assistant,
+                    Content = assistantBlocks
+                });
+
+                foreach (var toolUse in toolUseBlocks)
+                {
+                    var input = toolUse.Input.ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
+
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"\n[Инструмент: {toolUse.Name}]");
+                    if (input.Count > 0)
+                        Console.WriteLine($"Аргументы: {JsonSerializer.Serialize(input)}");
+                    Console.ResetColor();
+
+                    CallToolResult callResult;
+                    try
+                    {
+                        callResult = await _mcpManager.CallToolAsync(toolUse.Name, input);
+                    }
+                    catch (Exception ex)
+                    {
+                        var errorMsg = $"Ошибка вызова инструмента '{toolUse.Name}': {ex.Message}";
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"Ошибка: {errorMsg}");
+                        Console.ResetColor();
+
+                        var errorResultBlock = new ContentBlockParam(
+                            new ToolResultBlockParam(toolUse.ID)
+                            {
+                                Content = new ToolResultBlockParamContent(errorMsg),
+                                IsError = true
+                            });
+
+                        messages.Add(new MessageParam
+                        {
+                            Role = AnthropicRole.User,
+                            Content = new List<ContentBlockParam> { errorResultBlock }
+                        });
+
+                        currentRagResult = null;
+                        continue;
+                    }
+
+                    var formattedResult = McpToolMapper.FormatToolResult(callResult);
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    var preview = formattedResult.Length > 200 ? formattedResult[..200] + "..." : formattedResult;
+                    Console.WriteLine($"Результат: {preview}");
+                    Console.ResetColor();
+
+                    var resultBlock = new ContentBlockParam(
+                        new ToolResultBlockParam(toolUse.ID)
+                        {
+                            Content = new ToolResultBlockParamContent(formattedResult),
+                            IsError = false
+                        });
+
+                    messages.Add(new MessageParam
+                    {
+                        Role = AnthropicRole.User,
+                        Content = new List<ContentBlockParam> { resultBlock }
+                    });
+                }
+
+                currentRagResult = null;
+                continue;
+            }
+
+            var assistantText = string.Concat(response.Content
+                .Select(block => block.Value)
+                .OfType<TextBlock>()
+                .Select(tb => tb.Text ?? string.Empty));
+
+            if (currentRagResult != null)
+            {
+                try
+                {
+                    lastParsedAnswer = CitationAnswerParser.Parse(assistantText, currentRagResult.Chunks);
+                }
+                catch (JsonException)
+                {
+                    lastParsedAnswer = new CitationAnswer(
+                        Answer: assistantText.Trim(),
+                        Confidence: ConfidenceLevel.High,
+                        ClarificationRequest: null,
+                        Sources: [],
+                        Citations: []
+                    );
+                }
+            }
+            else
+            {
+                lastParsedAnswer = new CitationAnswer(
+                    Answer: assistantText.Trim(),
+                    Confidence: ConfidenceLevel.High,
+                    ClarificationRequest: null,
+                    Sources: [],
+                    Citations: []
+                );
+            }
+
+            if (currentRagResult != null && lastParsedAnswer?.Confidence == ConfidenceLevel.Unknown)
+            {
+                if (attempt < maxRetries)
+                {
+                    messages.Add(new MessageParam
+                    {
+                        Role = AnthropicRole.User,
+                        Content = "\n\n[SYSTEM: The context IS sufficient. Do NOT output confidence='unknown'. Provide a concrete answer with citations.]"
+                    });
+                    continue;
+                }
+            }
+
+            if (currentRagResult != null && GetEnvBool("RAG_ENABLE_VALIDATION", true))
+            {
+                var validation = _validator.Validate(lastParsedAnswer, currentRagResult.Chunks);
+
+                if (validation.IsValid)
+                    break;
+
+                if (attempt < maxRetries)
+                {
+                    messages.Add(new MessageParam
+                    {
+                        Role = AnthropicRole.User,
+                        Content = $"\n\n[SYSTEM FEEDBACK: Previous response had validation errors: {string.Join("; ", validation.Errors)}. Please fix and respond with valid JSON only.]"
+                    });
+                }
+                else
+                {
+                    lastParsedAnswer = CreateFallbackAnswer(currentRagResult);
+                }
+
+                currentRagResult = null;
+            }
+        }
+
+        lastParsedAnswer ??= (ragResult != null)
             ? CreateFallbackAnswer(ragResult, "All retries failed.")
             : new CitationAnswer(
                 Answer: "Unable to generate an answer. Please try again.",

@@ -3,12 +3,14 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Anthropic;
 
 const string Usage = """
-Assistant <repository-url> [target-directory] [--chat [--project-id <id>]] [--review --project-id <id> --merge-request-iid <iid>]
+Assistant <repository-url> [target-directory] [--chat [--anthropic] [--project-id <id>]] [--review --project-id <id> --merge-request-iid <iid>]
 
 Clones a Git repository at startup, then indexes the cloned content.
 With --chat flag: starts interactive RAG chat with a local LLM after indexing.
+With --chat --anthropic: uses Anthropic Claude API instead of OpenAI-compatible endpoint.
 With --review flag: performs an automated code review of a GitLab merge request (one-shot, no chat).
 
 Arguments:
@@ -17,6 +19,7 @@ Arguments:
 
 Flags:
   --chat                    Start interactive RAG chat mode after indexing
+  --anthropic               Use Anthropic Claude API (requires --chat)
   --review                  Enable automated code review mode (one-shot)
   --project-id <value>      GitLab project ID (used with --chat or --review)
   --merge-request-iid <val> Merge request IID (required with --review)
@@ -29,6 +32,8 @@ Environment variables:
   LLM_API_URL                  LLM API URL (default: http://localhost:1234)
   LLM_API_KEY                  LLM API key (optional)
   LLM_MODEL                    LLM model name (default: qwen/qwen3.6-35b-a3b)
+  ANTHROPIC_API_KEY            API key for Anthropic (required with --anthropic)
+  ANTHROPIC_MODEL              Anthropic model name (default: claude-opus-4-8)
   GITLAB_PERSONAL_ACCESS_TOKEN Personal Access Token for GitLab MCP server (optional)
   GITLAB_API_URL               Base URL for GitLab API, e.g. https://gitlab.example.com/api/v4 (optional)
 
@@ -36,7 +41,7 @@ Examples:
   dotnet run -- git@gitserver.local.yurion.ru:andreyk/rust-design-patterns.git
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat
-  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat LLM_API_URL=http://localhost:11434
+  dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --chat --anthropic
   dotnet run -- https://gitserver.local.yurion.ru/andreyk/rust-design-patterns.git ./output-dir --review --project-id 42 --merge-request-iid 123
 """;
 
@@ -51,6 +56,7 @@ var repoUrl = args[0];
 string targetDir = "./cloned-repo";
 bool runChat = false;
 bool runReview = false;
+bool useAnthropic = false;
 string? projectId = null;
 string? mergeRequestIid = null;
 
@@ -60,6 +66,10 @@ for (int i = 1; i < args.Length; i++)
     if (arg.Equals("--chat", StringComparison.OrdinalIgnoreCase))
     {
         runChat = true;
+    }
+    else if (arg.Equals("--anthropic", StringComparison.OrdinalIgnoreCase))
+    {
+        useAnthropic = true;
     }
     else if (arg.Equals("--review", StringComparison.OrdinalIgnoreCase))
     {
@@ -104,6 +114,13 @@ if (runReview)
     return;
 }
 
+if (useAnthropic && !runChat)
+{
+    Console.Error.WriteLine("Error: --anthropic requires --chat flag.");
+    Environment.ExitCode = 1;
+    return;
+}
+
 if (runChat && !string.IsNullOrWhiteSpace(projectId))
 {
     Console.WriteLine($"Project ID: {projectId}");
@@ -134,7 +151,7 @@ if (isCloned)
     Console.WriteLine($"Repository already cloned to: {targetDir}");
 
     // === ИНДЕКСАЦИЯ (пропускаем клонирование) ===
-    await RunIndexingAsync(targetDir, runChat, resolvedTargetDir, projectId);
+        await RunIndexingAsync(targetDir, runChat, useAnthropic, resolvedTargetDir, projectId);
 }
 else
 {
@@ -191,7 +208,7 @@ else
             Console.WriteLine(output);
 
         // === ИНДЕКСАЦИЯ (после успешного git clone) ===
-        await RunIndexingAsync(targetDir, runChat, resolvedTargetDir, projectId);
+        await RunIndexingAsync(targetDir, runChat, useAnthropic, resolvedTargetDir, projectId);
     }
     else
     {
@@ -204,7 +221,7 @@ else
     }
 }
 
-static async Task RunIndexingAsync(string targetDir, bool runChat, string resolvedTargetDir, string? projectId)
+static async Task RunIndexingAsync(string targetDir, bool runChat, bool useAnthropic, string resolvedTargetDir, string? projectId)
 {
     var dbPath = Path.Combine(Path.GetFullPath(targetDir), "document_index.db");
 
@@ -215,7 +232,7 @@ static async Task RunIndexingAsync(string targetDir, bool runChat, string resolv
         if (runChat)
         {
             Console.WriteLine("\n=== Запуск интерактивного чата ===");
-            await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId);
+            await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId, useAnthropic);
         }
 
         return;
@@ -275,11 +292,11 @@ static async Task RunIndexingAsync(string targetDir, bool runChat, string resolv
     if (runChat)
     {
         Console.WriteLine("\n=== Запуск интерактивного чата ===");
-        await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId);
+        await RunChatAsync(targetDir, dbPath, resolvedTargetDir, projectId, useAnthropic);
     }
 }
 
-static async Task RunChatAsync(string targetDir, string dbPath, string resolvedTargetDir, string? projectId)
+static async Task RunChatAsync(string targetDir, string dbPath, string resolvedTargetDir, string? projectId, bool useAnthropic)
 {
     var store = new SqliteVectorStore(dbPath);
     await store.InitializeAsync();
@@ -288,30 +305,62 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
     var embeddingModel = Environment.GetEnvironmentVariable("EMBEDDING_MODEL") ?? "text-embedding-nomic-embed-text-v1.5";
     var embeddingService = new OpenAiCompatibleEmbeddingService(embeddingApiUrl, embeddingModel);
 
-    var llmApiUrl = Environment.GetEnvironmentVariable("LLM_API_URL") ?? "http://192.168.1.15:1234";
-    var llmModel = Environment.GetEnvironmentVariable("LLM_MODEL") ?? "qwen/qwen3.6-35b-a3b";
-    var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
-
-    Console.WriteLine($"Проверка LLM API ({llmApiUrl})...");
     ILlmService llm;
-    try 
+    AnthropicClient? anthropicClient = null;
+    string? anthropicModel = null;
+
+    if (useAnthropic)
     {
-        llm = new OpenAiCompatibleLlmService(llmApiUrl, llmModel, llmApiKey, 4096);
-        // Quick connectivity check by making a minimal request
-        var testPrompt = "Respond with exactly: OK";
-        await llm.AskAsync(testPrompt, "You are a test assistant. Respond with exactly 'OK' and nothing else.", 10);
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine("✅ LLM API доступен\n");
-        Console.ResetColor();
+        Console.WriteLine("Инициализация Anthropic Claude API...");
+        try
+        {
+            var anthropicLlm = new AnthropicLlmService();
+            anthropicClient = anthropicLlm.Client;
+            anthropicModel = anthropicLlm.Model;
+            llm = anthropicLlm;
+
+            var testPrompt = "Respond with exactly: OK";
+            await llm.AskAsync(testPrompt, "You are a test assistant.", 10);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"✅ Anthropic API доступен (модель: {anthropicModel})\n");
+            Console.ResetColor();
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"❌ Anthropic API недоступен: {ex.Message}");
+            Console.ResetColor();
+            Console.WriteLine("Убедитесь, что ANTHROPIC_API_KEY установлен.");
+            embeddingService.Dispose();
+            return;
+        }
     }
-    catch (Exception ex) 
+    else
     {
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"❌ LLM API недоступен: {ex.Message}");
-        Console.ResetColor();
-        Console.WriteLine("Убедитесь, что LLM API запущен на {0}", llmApiUrl);
-        Console.WriteLine("Запустите без --chat для работы только с индексацией.");
-        return;
+        var llmApiUrl = Environment.GetEnvironmentVariable("LLM_API_URL") ?? "http://192.168.1.15:1234";
+        var llmModel = Environment.GetEnvironmentVariable("LLM_MODEL") ?? "qwen/qwen3.6-35b-a3b";
+        var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
+
+        Console.WriteLine($"Проверка LLM API ({llmApiUrl})...");
+        try
+        {
+            llm = new OpenAiCompatibleLlmService(llmApiUrl, llmModel, llmApiKey, 4096);
+            var testPrompt = "Respond with exactly: OK";
+            await llm.AskAsync(testPrompt, "You are a test assistant. Respond with exactly 'OK' and nothing else.", 10);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("✅ LLM API доступен\n");
+            Console.ResetColor();
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"❌ LLM API недоступен: {ex.Message}");
+            Console.ResetColor();
+            Console.WriteLine("Убедитесь, что LLM API запущен на {0}", llmApiUrl);
+            Console.WriteLine("Запустите без --chat для работы только с индексацией.");
+            embeddingService.Dispose();
+            return;
+        }
     }
 
     var extensions = new[] { ".txt", ".md", ".cs", ".json", ".xml", ".yaml", ".yml", ".html", ".js", ".py" };
@@ -328,14 +377,17 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
         // Git MCP server (uvx)
         mcpManager.AddServer("git", "uvx", new[] { "mcp-server-git" });
 
-        // GitLab MCP server (direct executable)
-        var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
-        var gitlabApiUrl  = Environment.GetEnvironmentVariable("GITLAB_API_URL");
-
-        if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+        if (!useAnthropic)
         {
-            mcpManager.AddServer("zereight-mcp-gitlab", "zereight-mcp-gitlab",
-                new[] { "--token=" + gitlabToken, "--api-url=" + gitlabApiUrl });
+            // GitLab MCP server — only in OpenAI-compatible mode
+            var gitlabToken = Environment.GetEnvironmentVariable("GITLAB_PERSONAL_ACCESS_TOKEN");
+            var gitlabApiUrl = Environment.GetEnvironmentVariable("GITLAB_API_URL");
+
+            if (!string.IsNullOrEmpty(gitlabToken) && !string.IsNullOrEmpty(gitlabApiUrl))
+            {
+                mcpManager.AddServer("zereight-mcp-gitlab", "zereight-mcp-gitlab",
+                    new[] { "--token=" + gitlabToken, "--api-url=" + gitlabApiUrl });
+            }
         }
 
         // Filesystem MCP server (npx @modelcontextprotocol/server-filesystem)
@@ -349,7 +401,8 @@ static async Task RunChatAsync(string targetDir, string dbPath, string resolvedT
     ChatService chat;
     if (mcpManager != null && mcpManager.IsConnected)
     {
-        chat = new ChatService(llm, rag, validator, mcpManager, resolvedTargetDir, projectId);
+        chat = new ChatService(llm, rag, validator, mcpManager, resolvedTargetDir, projectId,
+            anthropicClient: anthropicClient, anthropicModel: anthropicModel);
     }
     else if (rag != null)
     {
