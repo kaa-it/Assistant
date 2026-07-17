@@ -531,13 +531,13 @@ public class ChatService
     private async Task<CitationAnswer> ProcessWithAnthropicToolCallingAsync(
         string userPrompt, string systemPrompt, RagResult? ragResult, int maxRetries, CancellationToken ct)
     {
+        const int maxToolRounds = 20;
+
         var anthropicTools = AnthropicToolMapper.ConvertToAnthropicTools(_mcpManager!.Tools!);
 
         var effectiveSystemPrompt = ragResult == null
             ? (_rag == null ? PromptBuilder.McpOnlySystemPrompt : PromptBuilder.FallbackSystemPrompt)
             : systemPrompt;
-
-        effectiveSystemPrompt = ToolPromptBuilder.BuildSystemPromptWithTools(effectiveSystemPrompt, _mcpManager.Tools!);
 
         if (!string.IsNullOrEmpty(_repoPath))
             effectiveSystemPrompt += $"\n\n[REPOSITORY PATH: {_repoPath}]";
@@ -549,24 +549,39 @@ public class ChatService
         messages.Add(new MessageParam
         {
             Role = AnthropicRole.User,
-            Content = effectiveSystemPrompt + "\n\n" + (ragResult != null ? BuildUserMessageWithChunks(userPrompt) : userPrompt)
+            Content = ragResult != null ? BuildUserMessageWithChunks(userPrompt) : userPrompt
         });
 
         var currentRagResult = ragResult;
         CitationAnswer? lastParsedAnswer = null;
 
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        for (int toolRound = 1; toolRound <= maxToolRounds; toolRound++)
         {
+            Console.WriteLine($"\n[Anthropic] Раунд {toolRound}/{maxToolRounds}...");
+
             var parameters = new MessageCreateParams
             {
                 Model = _anthropicModel!,
-                MaxTokens = MaxTokens,
+                MaxTokens = 4096,
                 System = effectiveSystemPrompt,
                 Messages = messages,
                 Tools = anthropicTools,
             };
 
-            var response = await _anthropicClient!.Messages.Create(parameters, ct);
+            Anthropic.Models.Messages.Message response;
+            try
+            {
+                response = await _anthropicClient!.Messages.Create(parameters, ct);
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[Anthropic] Ошибка API: {ex.Message}");
+                Console.ResetColor();
+                break;
+            }
+
+            Console.WriteLine($"[Anthropic] stop_reason={response.StopReason}, content blocks={response.Content.Count}");
 
             var toolUseBlocks = response.Content
                 .Select(block => block.Value)
@@ -634,7 +649,6 @@ public class ChatService
                             Content = new List<ContentBlockParam> { errorResultBlock }
                         });
 
-                        currentRagResult = null;
                         continue;
                     }
 
@@ -658,7 +672,6 @@ public class ChatService
                     });
                 }
 
-                currentRagResult = null;
                 continue;
             }
 
@@ -666,6 +679,8 @@ public class ChatService
                 .Select(block => block.Value)
                 .OfType<TextBlock>()
                 .Select(tb => tb.Text ?? string.Empty));
+
+            Console.WriteLine($"[Anthropic] Текстовый ответ получен ({assistantText.Length} символов).");
 
             if (currentRagResult != null)
             {
@@ -695,49 +710,87 @@ public class ChatService
                 );
             }
 
-            if (currentRagResult != null && lastParsedAnswer?.Confidence == ConfidenceLevel.Unknown)
+            break;
+        }
+
+        if (lastParsedAnswer != null && currentRagResult != null && lastParsedAnswer.Confidence == ConfidenceLevel.Unknown)
+        {
+            for (int retry = 1; retry <= maxRetries; retry++)
             {
-                if (attempt < maxRetries)
+                Console.WriteLine($"[Anthropic] Confidence=unknown, попытка корректировки {retry}/{maxRetries}...");
+
+                var retryMessages = new List<MessageParam>(messages);
+                retryMessages.Add(new MessageParam
                 {
-                    messages.Add(new MessageParam
+                    Role = AnthropicRole.User,
+                    Content = "\n\n[SYSTEM: The context IS sufficient. Do NOT output confidence='unknown'. Provide a concrete answer with citations.]"
+                });
+
+                var retryParams = new MessageCreateParams
+                {
+                    Model = _anthropicModel!,
+                    MaxTokens = 4096,
+                    System = effectiveSystemPrompt,
+                    Messages = retryMessages,
+                    Tools = anthropicTools,
+                };
+
+                try
+                {
+                    var response = await _anthropicClient!.Messages.Create(retryParams, ct);
+                    var text = string.Concat(response.Content
+                        .Select(b => b.Value)
+                        .OfType<TextBlock>()
+                        .Select(tb => tb.Text ?? string.Empty));
+
+                    if (!string.IsNullOrWhiteSpace(text))
                     {
-                        Role = AnthropicRole.User,
-                        Content = "\n\n[SYSTEM: The context IS sufficient. Do NOT output confidence='unknown'. Provide a concrete answer with citations.]"
-                    });
-                    continue;
+                        try
+                        {
+                            lastParsedAnswer = CitationAnswerParser.Parse(text, currentRagResult.Chunks);
+                        }
+                        catch (JsonException)
+                        {
+                            lastParsedAnswer = new CitationAnswer(
+                                Answer: text.Trim(),
+                                Confidence: ConfidenceLevel.High,
+                                ClarificationRequest: null,
+                                Sources: [],
+                                Citations: []
+                            );
+                        }
+
+                        if (lastParsedAnswer.Confidence != ConfidenceLevel.Unknown)
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[Anthropic] Ошибка API при корректировке: {ex.Message}");
+                    Console.ResetColor();
+                    break;
                 }
             }
+        }
 
-            if (currentRagResult != null && GetEnvBool("RAG_ENABLE_VALIDATION", true))
+        if (lastParsedAnswer != null && currentRagResult != null && GetEnvBool("RAG_ENABLE_VALIDATION", true))
+        {
+            var validation = _validator.Validate(lastParsedAnswer, currentRagResult.Chunks);
+            if (!validation.IsValid)
             {
-                var validation = _validator.Validate(lastParsedAnswer, currentRagResult.Chunks);
-
-                if (validation.IsValid)
-                    break;
-
-                if (attempt < maxRetries)
-                {
-                    messages.Add(new MessageParam
-                    {
-                        Role = AnthropicRole.User,
-                        Content = $"\n\n[SYSTEM FEEDBACK: Previous response had validation errors: {string.Join("; ", validation.Errors)}. Please fix and respond with valid JSON only.]"
-                    });
-                }
-                else
-                {
-                    lastParsedAnswer = CreateFallbackAnswer(currentRagResult);
-                }
-
-                currentRagResult = null;
+                Console.WriteLine($"[Anthropic] Валидация не пройдена: {string.Join("; ", validation.Errors)}");
+                lastParsedAnswer = CreateFallbackAnswer(currentRagResult,
+                    $"Validation failed: {string.Join("; ", validation.Errors)}");
             }
         }
 
         lastParsedAnswer ??= (ragResult != null)
-            ? CreateFallbackAnswer(ragResult, "All retries failed.")
+            ? CreateFallbackAnswer(ragResult, "No text response received from Anthropic.")
             : new CitationAnswer(
                 Answer: "Unable to generate an answer. Please try again.",
                 Confidence: ConfidenceLevel.Unknown,
-                ClarificationRequest: "All retries failed. No context was available.",
+                ClarificationRequest: "No text response received from Anthropic.",
                 Sources: [],
                 Citations: []
             );

@@ -26,7 +26,7 @@ public static class AnthropicToolMapper
                 {
                     Type = JsonSerializer.SerializeToElement("object", JsonOptions),
                     Properties = properties,
-                    Required = required
+                    Required = required ?? []
                 }
             }));
         }

@@ -18,10 +18,9 @@ public class AnthropicLlmService : ILlmService
     {
         var key = apiKey
                   ?? Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
-                  ?? throw new InvalidOperationException(
-                      "Anthropic API key is not configured. Set ANTHROPIC_API_KEY environment variable.");
+                  ?? "";
 
-        _client = new AnthropicClient { ApiKey = key };
+        _client = new AnthropicClient { ApiKey = "", BaseUrl = "http://192.168.1.15:1234" };
         _model = model
                  ?? Environment.GetEnvironmentVariable("ANTHROPIC_MODEL")
                  ?? "claude-opus-4-8";
